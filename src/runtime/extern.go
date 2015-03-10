@@ -189,3 +189,20 @@ const GOOS string = theGoos
 // GOARCH is the running program's architecture target:
 // 386, amd64, or arm.
 const GOARCH string = theGoarch
+
+// GoID returns the unique id of the current goroutine
+func GoID() int64 {
+	return getg().goid
+}
+
+// SetGroupID sets the group id for the current goroutine.
+// The group id is inherited by new goroutines created by this
+// goroutine.
+func SetGroupID(id int64) {
+	getg().groupid = id
+}
+
+// GetGroupID returns the group id for the current goroutine
+func GetGroupID() int64 {
+	return getg().groupid
+}

@@ -2017,8 +2017,9 @@ func malg(stacksize int32) *g {
 func newproc(siz int32, fn *funcval) {
 	argp := add(unsafe.Pointer(&fn), ptrSize)
 	pc := getcallerpc(unsafe.Pointer(&siz))
+	gid := getg().groupid
 	systemstack(func() {
-		newproc1(fn, (*uint8)(argp), siz, 0, pc)
+		newproc1(fn, (*uint8)(argp), siz, 0, pc, gid)
 	})
 }
 
@@ -2026,7 +2027,7 @@ func newproc(siz int32, fn *funcval) {
 // at argp and returning nret bytes of results.  callerpc is the
 // address of the go statement that created this.  The new g is put
 // on the queue of g's waiting to run.
-func newproc1(fn *funcval, argp *uint8, narg int32, nret int32, callerpc uintptr) *g {
+func newproc1(fn *funcval, argp *uint8, narg int32, nret int32, callerpc uintptr, gid int64) *g {
 	_g_ := getg()
 
 	if fn == nil {
@@ -2088,6 +2089,8 @@ func newproc1(fn *funcval, argp *uint8, narg int32, nret int32, callerpc uintptr
 		_p_.goidcacheend = _p_.goidcache + _GoidCacheBatch
 	}
 	newg.goid = int64(_p_.goidcache)
+	newg.groupid = gid // copy down the group id
+
 	_p_.goidcache++
 	if raceenabled {
 		newg.racectx = racegostart(callerpc)
