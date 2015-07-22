@@ -50,6 +50,8 @@ func dumpregs(c *sigctxt) {
 	print("trap ", hex(c.trap()), "\n")
 }
 
+// May run during STW, so write barriers are not allowed.
+//go:nowritebarrier
 func sighandler(sig uint32, info *siginfo, ctxt unsafe.Pointer, gp *g) {
 	_g_ := getg()
 	c := &sigctxt{info, ctxt}
@@ -82,11 +84,21 @@ func sighandler(sig uint32, info *siginfo, ctxt unsafe.Pointer, gp *g) {
 		c.set_sp(sp)
 		*(*uint64)(unsafe.Pointer(uintptr(sp))) = c.link()
 
+		pc := uintptr(gp.sigpc)
+
+		// If we don't recognize the PC as code
+		// but we do recognize the link register as code,
+		// then assume this was a call to non-code and treat like
+		// pc == 0, to make unwinding show the context.
+		if pc != 0 && findfunc(pc) == nil && findfunc(uintptr(c.link())) != nil {
+			pc = 0
+		}
+
 		// Don't bother saving PC if it's zero, which is
 		// probably a call to a nil func: the old link register
 		// is more useful in the stack trace.
-		if gp.sigpc != 0 {
-			c.set_link(uint64(gp.sigpc))
+		if pc != 0 {
+			c.set_link(uint64(pc))
 		}
 
 		// In case we are panicking from external C code
@@ -111,7 +123,7 @@ func sighandler(sig uint32, info *siginfo, ctxt unsafe.Pointer, gp *g) {
 	}
 
 	_g_.m.throwing = 1
-	_g_.m.caughtsig = gp
+	_g_.m.caughtsig.set(gp)
 	startpanic()
 
 	if sig < uint32(len(sigtable)) {

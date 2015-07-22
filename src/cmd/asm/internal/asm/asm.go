@@ -22,9 +22,20 @@ var testOut *bytes.Buffer // Gathers output when testing.
 // append adds the Prog to the end of the program-thus-far.
 // If doLabel is set, it also defines the labels collect for this Prog.
 func (p *Parser) append(prog *obj.Prog, cond string, doLabel bool) {
-	if p.arch.Thechar == '5' {
-		if !arch.ARMConditionCodes(prog, cond) {
-			p.errorf("unrecognized condition code .%q", cond)
+	if cond != "" {
+		switch p.arch.Thechar {
+		case '5':
+			if !arch.ARMConditionCodes(prog, cond) {
+				p.errorf("unrecognized condition code .%q", cond)
+			}
+
+		case '7':
+			if !arch.ARM64Suffix(prog, cond) {
+				p.errorf("unrecognized suffix .%q", cond)
+			}
+
+		default:
+			p.errorf("unrecognized suffix .%q", cond)
 		}
 	}
 	if p.firstProg == nil {
@@ -140,7 +151,7 @@ func (p *Parser) asmText(word string, operands [][]lex.Token) {
 		As:     obj.ATEXT,
 		Lineno: p.histLineNum,
 		From:   nameAddr,
-		From3: obj.Addr{
+		From3: &obj.Addr{
 			Type:   obj.TYPE_CONST,
 			Offset: flag,
 		},
@@ -150,7 +161,7 @@ func (p *Parser) asmText(word string, operands [][]lex.Token) {
 			// Argsize set below.
 		},
 	}
-	prog.To.U.Argsize = int32(argSize)
+	prog.To.Val = int32(argSize)
 
 	p.append(prog, "", true)
 }
@@ -194,7 +205,7 @@ func (p *Parser) asmData(word string, operands [][]lex.Token) {
 		As:     obj.ADATA,
 		Lineno: p.histLineNum,
 		From:   nameAddr,
-		From3: obj.Addr{
+		From3: &obj.Addr{
 			Offset: int64(scale),
 		},
 		To: valueAddr,
@@ -233,7 +244,7 @@ func (p *Parser) asmGlobl(word string, operands [][]lex.Token) {
 		As:     obj.AGLOBL,
 		Lineno: p.histLineNum,
 		From:   nameAddr,
-		From3: obj.Addr{
+		From3: &obj.Addr{
 			Offset: flag,
 		},
 		To: addr,
@@ -307,14 +318,9 @@ func (p *Parser) asmJump(op int, cond string, a []obj.Addr) {
 	case 1:
 		target = &a[0]
 	case 2:
-		if p.arch.Thechar == '9' {
-			// Special 2-operand jumps.
-			target = &a[1]
-			prog.From = a[0]
-			break
-		}
-		p.errorf("wrong number of arguments to %s instruction", obj.Aconv(op))
-		return
+		// Special 2-operand jumps.
+		target = &a[1]
+		prog.From = a[0]
 	case 3:
 		if p.arch.Thechar == '9' {
 			// Special 3-operand jumps.
@@ -400,7 +406,7 @@ func (p *Parser) branch(jmp, target *obj.Prog) {
 		Type:  obj.TYPE_BRANCH,
 		Index: 0,
 	}
-	jmp.To.U.Branch = target
+	jmp.To.Val = target
 }
 
 // asmInstruction assembles an instruction.
@@ -457,6 +463,10 @@ func (p *Parser) asmInstruction(op int, cond string, a []obj.Addr) {
 				}
 				p.errorf("unrecognized addressing for %s", obj.Aconv(op))
 			}
+		} else if p.arch.Thechar == '7' && arch.IsARM64CMP(op) {
+			prog.From = a[0]
+			prog.Reg = p.getRegister(prog, op, &a[1])
+			break
 		}
 		prog.From = a[0]
 		prog.To = a[1]
@@ -478,9 +488,23 @@ func (p *Parser) asmInstruction(op int, cond string, a []obj.Addr) {
 			prog.From = a[0]
 			prog.Reg = p.getRegister(prog, op, &a[1])
 			prog.To = a[2]
+		case '7':
+			// ARM64 instructions with one input and two outputs.
+			if arch.IsARM64STLXR(op) {
+				prog.From = a[0]
+				prog.To = a[1]
+				if a[2].Type != obj.TYPE_REG {
+					p.errorf("invalid addressing modes for third operand to %s instruction, must be register", obj.Aconv(op))
+				}
+				prog.RegTo2 = a[2].Reg
+				break
+			}
+			prog.From = a[0]
+			prog.Reg = p.getRegister(prog, op, &a[1])
+			prog.To = a[2]
 		case '6', '8':
 			prog.From = a[0]
-			prog.From3 = a[1]
+			prog.From3 = newAddr(a[1])
 			prog.To = a[2]
 		case '9':
 			if arch.IsPPC64CMP(op) {
@@ -502,7 +526,7 @@ func (p *Parser) asmInstruction(op int, cond string, a []obj.Addr) {
 				prog.To = a[2]
 			case obj.TYPE_CONST:
 				prog.From = a[0]
-				prog.From3 = a[1]
+				prog.From3 = newAddr(a[1])
 				prog.To = a[2]
 			default:
 				p.errorf("invalid addressing modes for %s instruction", obj.Aconv(op))
@@ -524,13 +548,20 @@ func (p *Parser) asmInstruction(op int, cond string, a []obj.Addr) {
 			prog.Reg = r1
 			break
 		}
+		if p.arch.Thechar == '7' {
+			prog.From = a[0]
+			prog.Reg = p.getRegister(prog, op, &a[1])
+			prog.From3 = newAddr(a[2])
+			prog.To = a[3]
+			break
+		}
 		if p.arch.Thechar == '9' && arch.IsPPC64RLD(op) {
 			// 2nd operand must always be a register.
 			// TODO: Do we need to guard this with the instruction type?
 			// That is, are there 4-operand instructions without this property?
 			prog.From = a[0]
 			prog.Reg = p.getRegister(prog, op, &a[1])
-			prog.From3 = a[2]
+			prog.From3 = newAddr(a[2])
 			prog.To = a[3]
 			break
 		}
@@ -548,7 +579,7 @@ func (p *Parser) asmInstruction(op int, cond string, a []obj.Addr) {
 			} else {
 				mask = (^uint32(0) >> uint(mask2+1)) & (^uint32(0) << uint(31-(mask1-1)))
 			}
-			prog.From3 = obj.Addr{
+			prog.From3 = &obj.Addr{
 				Type:   obj.TYPE_CONST,
 				Offset: int64(mask),
 			}
@@ -567,12 +598,13 @@ func (p *Parser) asmInstruction(op int, cond string, a []obj.Addr) {
 			x4 := int64(p.getRegister(prog, op, &a[4]))
 			x5 := p.getConstant(prog, op, &a[5])
 			// Cond is handled specially for this instruction.
-			offset, ok := arch.ARMMRCOffset(op, cond, x0, x1, x2, x3, x4, x5)
+			offset, MRC, ok := arch.ARMMRCOffset(op, cond, x0, x1, x2, x3, x4, x5)
 			if !ok {
 				p.errorf("unrecognized condition code .%q", cond)
 			}
 			prog.To.Offset = offset
 			cond = ""
+			prog.As = MRC // Both instructions are coded as MRC.
 			break
 		}
 		fallthrough
@@ -581,6 +613,13 @@ func (p *Parser) asmInstruction(op int, cond string, a []obj.Addr) {
 	}
 
 	p.append(prog, cond, true)
+}
+
+// newAddr returns a new(Addr) initialized to x.
+func newAddr(x obj.Addr) *obj.Addr {
+	p := new(obj.Addr)
+	*p = x
+	return p
 }
 
 var emptyProg obj.Prog

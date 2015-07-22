@@ -117,7 +117,7 @@ TEXT runtime·write(SB),NOSPLIT,$-8
 	MOVW	R0, ret+12(FP)
 	RET
 
-TEXT runtime·close(SB),NOSPLIT,$-8
+TEXT runtime·closefd(SB),NOSPLIT,$-8
 	MOVW fd+0(FP), R0	// arg 1 fd
 	MOVW $SYS_close, R7
 	SWI $0
@@ -380,6 +380,10 @@ TEXT runtime·casp1(SB),NOSPLIT,$0
 //		return 0;
 TEXT runtime·cas(SB),NOSPLIT,$0
 	B runtime·armcas(SB)
+
+// TODO: this is only valid for ARMv7+
+TEXT ·publicationBarrier(SB),NOSPLIT,$-4-0
+	B	runtime·armPublicationBarrier(SB)
 
 // TODO(minux): this only supports ARMv6K+.
 TEXT runtime·read_tls_fallback(SB),NOSPLIT,$-4

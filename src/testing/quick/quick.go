@@ -102,12 +102,16 @@ func Value(t reflect.Type, rand *rand.Rand) (value reflect.Value, ok bool) {
 			v.SetMapIndex(key, value)
 		}
 	case reflect.Ptr:
-		elem, ok := Value(concrete.Elem(), rand)
-		if !ok {
-			return reflect.Value{}, false
+		if rand.Intn(complexSize) == 0 {
+			v.Set(reflect.Zero(concrete)) // Generate nil pointer.
+		} else {
+			elem, ok := Value(concrete.Elem(), rand)
+			if !ok {
+				return reflect.Value{}, false
+			}
+			v.Set(reflect.New(concrete.Elem()))
+			v.Elem().Set(elem)
 		}
-		v.Set(reflect.New(concrete.Elem()))
-		v.Elem().Set(elem)
 	case reflect.Slice:
 		numElems := rand.Intn(complexSize)
 		v.Set(reflect.MakeSlice(concrete, numElems, numElems))
@@ -161,7 +165,7 @@ type Config struct {
 	Rand *rand.Rand
 	// If non-nil, the Values function generates a slice of arbitrary
 	// reflect.Values that are congruent with the arguments to the function
-	// being tested. Otherwise, the top-level Values function is used
+	// being tested. Otherwise, the top-level Value function is used
 	// to generate them.
 	Values func([]reflect.Value, *rand.Rand)
 }
@@ -245,7 +249,7 @@ func Check(f interface{}, config *Config) (err error) {
 	}
 
 	if fType.NumOut() != 1 {
-		err = SetupError("function returns more than one value.")
+		err = SetupError("function does not return one value")
 		return
 	}
 	if fType.Out(0).Kind() != reflect.Bool {

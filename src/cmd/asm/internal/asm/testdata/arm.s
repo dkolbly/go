@@ -1,3 +1,7 @@
+// Copyright 2015 The Go Authors.  All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 // This input was created by taking the instruction productions in
 // the old assembler's (5a's) grammar and hand-writing complete
 // instructions for each rule, to guarantee we cover the same space.
@@ -229,8 +233,8 @@ TEXT	foo(SB), 0, $0
 //			(1<<4));			/* must be set */
 //		outcode(AMRC, Always, &nullgen, 0, &g);
 //	}
-// TODO: Disabled until printout for this instruction is the same for 32 and 64 bits.
-//	MRC.S	4, 6, R1, C2, C3, 7
+	MRC.S	4, 6, R1, C2, C3, 7
+	MCR.S	4, 6, R1, C2, C3, 7
 
 //
 // MULL r1,r2,(hi,lo)

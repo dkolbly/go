@@ -5,6 +5,7 @@
 package main
 
 import (
+	"internal/testenv"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -15,14 +16,7 @@ import (
 )
 
 func buildObjdump(t *testing.T) (tmp, exe string) {
-	switch runtime.GOOS {
-	case "android", "nacl":
-		t.Skipf("skipping on %s", runtime.GOOS)
-	case "darwin":
-		if runtime.GOARCH == "arm" {
-			t.Skipf("skipping on %s/%s", runtime.GOOS, runtime.GOARCH)
-		}
-	}
+	testenv.MustHaveGoBuild(t)
 
 	tmp, err := ioutil.TempDir("", "TestObjDump")
 	if err != nil {
@@ -108,6 +102,8 @@ func TestDisasm(t *testing.T) {
 	switch runtime.GOARCH {
 	case "ppc64", "ppc64le":
 		t.Skipf("skipping on %s, issue 9039", runtime.GOARCH)
+	case "arm64":
+		t.Skipf("skipping on %s, issue 10106", runtime.GOARCH)
 	}
 	testDisasm(t)
 }
@@ -120,6 +116,12 @@ func TestDisasmExtld(t *testing.T) {
 	switch runtime.GOARCH {
 	case "ppc64", "ppc64le":
 		t.Skipf("skipping on %s, no support for external linking, issue 9038", runtime.GOARCH)
+	case "arm64":
+		t.Skipf("skipping on %s, issue 10106", runtime.GOARCH)
+	}
+	// TODO(jsing): Reenable once openbsd/arm has external linking support.
+	if runtime.GOOS == "openbsd" && runtime.GOARCH == "arm" {
+		t.Skip("skipping on openbsd/arm, no support for external linking, issue 10619")
 	}
 	testDisasm(t, "-ldflags=-linkmode=external")
 }

@@ -64,6 +64,7 @@ func printStderr(args ...interface{}) (int, error) {
 
 func runRun(cmd *Command, args []string) {
 	raceInit()
+	buildModeInit()
 	var b builder
 	b.init()
 	b.print = printStderr
@@ -136,6 +137,7 @@ func runStdin(cmdline []string) {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.Env = origEnv
 	startSigHandlers()
 	if err := cmd.Run(); err != nil {
 		errorf("%v", err)

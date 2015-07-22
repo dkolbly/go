@@ -946,15 +946,19 @@ var expSC = []float64{
 
 var vfexpm1SC = []float64{
 	Inf(-1),
+	-710,
 	Copysign(0, -1),
 	0,
+	710,
 	Inf(1),
 	NaN(),
 }
 var expm1SC = []float64{
 	-1,
+	-1,
 	Copysign(0, -1),
 	0,
+	Inf(1),
 	Inf(1),
 	NaN(),
 }
@@ -1726,8 +1730,10 @@ func tolerance(a, b, e float64) bool {
 		d = -d
 	}
 
-	if a != 0 {
-		e = e * a
+	// note: b is correct (expected) value, a is actual value.
+	// make error tolerance a fraction of b, not a.
+	if b != 0 {
+		e = e * b
 		if e < 0 {
 			e = -e
 		}
@@ -2639,7 +2645,7 @@ func TestLargeTan(t *testing.T) {
 
 // Check that math constants are accepted by compiler
 // and have right value (assumes strconv.ParseFloat works).
-// http://golang.org/issue/201
+// https://golang.org/issue/201
 
 type floatTest struct {
 	val  interface{}
@@ -2977,15 +2983,56 @@ func BenchmarkSinh(b *testing.B) {
 	}
 }
 
+var Global float64
+
 func BenchmarkSqrt(b *testing.B) {
+	x, y := 0.0, 10.0
 	for i := 0; i < b.N; i++ {
-		Sqrt(10)
+		x += Sqrt(y)
 	}
+	Global = x
+}
+
+func BenchmarkSqrtIndirect(b *testing.B) {
+	x, y := 0.0, 10.0
+	f := Sqrt
+	for i := 0; i < b.N; i++ {
+		x += f(y)
+	}
+	Global = x
 }
 
 func BenchmarkSqrtGo(b *testing.B) {
+	x, y := 0.0, 10.0
 	for i := 0; i < b.N; i++ {
-		SqrtGo(10)
+		x += SqrtGo(y)
+	}
+	Global = x
+}
+
+func isPrime(i int) bool {
+	// Yes, this is a dumb way to write this code,
+	// but calling Sqrt repeatedly in this way demonstrates
+	// the benefit of using a direct SQRT instruction on systems
+	// that have one, whereas the obvious loop seems not to
+	// demonstrate such a benefit.
+	for j := 2; float64(j) <= Sqrt(float64(i)); j++ {
+		if i%j == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func BenchmarkSqrtPrime(b *testing.B) {
+	any := false
+	for i := 0; i < b.N; i++ {
+		if isPrime(100003) {
+			any = true
+		}
+	}
+	if any {
+		Global = 1
 	}
 }
 

@@ -113,7 +113,7 @@ func chansend(t *chantype, c *hchan, ep unsafe.Pointer, block bool, callerpc uin
 		if !block {
 			return false
 		}
-		gopark(nil, nil, "chan send (nil chan)", traceEvGoStop)
+		gopark(nil, nil, "chan send (nil chan)", traceEvGoStop, 2)
 		throw("unreachable")
 	}
 
@@ -165,14 +165,13 @@ func chansend(t *chantype, c *hchan, ep unsafe.Pointer, block bool, callerpc uin
 
 			recvg := sg.g
 			if sg.elem != nil {
-				typedmemmove(c.elemtype, unsafe.Pointer(sg.elem), ep)
-				sg.elem = nil
+				syncsend(c, sg, ep)
 			}
 			recvg.param = unsafe.Pointer(sg)
 			if sg.releasetime != 0 {
 				sg.releasetime = cputicks()
 			}
-			goready(recvg)
+			goready(recvg, 3)
 			return true
 		}
 
@@ -195,7 +194,7 @@ func chansend(t *chantype, c *hchan, ep unsafe.Pointer, block bool, callerpc uin
 		mysg.selectdone = nil
 		gp.param = nil
 		c.sendq.enqueue(mysg)
-		goparkunlock(&c.lock, "chan send", traceEvGoBlockSend)
+		goparkunlock(&c.lock, "chan send", traceEvGoBlockSend, 3)
 
 		// someone woke us up.
 		if mysg != gp.waiting {
@@ -219,7 +218,7 @@ func chansend(t *chantype, c *hchan, ep unsafe.Pointer, block bool, callerpc uin
 	// asynchronous channel
 	// wait for some space to write our data
 	var t1 int64
-	for c.qcount >= c.dataqsiz {
+	for futile := byte(0); c.qcount >= c.dataqsiz; futile = traceFutileWakeup {
 		if !block {
 			unlock(&c.lock)
 			return false
@@ -234,7 +233,7 @@ func chansend(t *chantype, c *hchan, ep unsafe.Pointer, block bool, callerpc uin
 		mysg.elem = nil
 		mysg.selectdone = nil
 		c.sendq.enqueue(mysg)
-		goparkunlock(&c.lock, "chan send", traceEvGoBlockSend)
+		goparkunlock(&c.lock, "chan send", traceEvGoBlockSend|futile, 3)
 
 		// someone woke us up - try again
 		if mysg.releasetime > 0 {
@@ -268,7 +267,7 @@ func chansend(t *chantype, c *hchan, ep unsafe.Pointer, block bool, callerpc uin
 		if sg.releasetime != 0 {
 			sg.releasetime = cputicks()
 		}
-		goready(recvg)
+		goready(recvg, 3)
 	} else {
 		unlock(&c.lock)
 	}
@@ -276,6 +275,21 @@ func chansend(t *chantype, c *hchan, ep unsafe.Pointer, block bool, callerpc uin
 		blockevent(t1-t0, 2)
 	}
 	return true
+}
+
+func syncsend(c *hchan, sg *sudog, elem unsafe.Pointer) {
+	// Send on unbuffered channel is the only operation
+	// in the entire runtime where one goroutine
+	// writes to the stack of another goroutine. The GC assumes that
+	// stack writes only happen when the goroutine is running and are
+	// only done by that goroutine. Using a write barrier is sufficient to
+	// make up for violating that assumption, but the write barrier has to work.
+	// typedmemmove will call heapBitsBulkBarrier, but the target bytes
+	// are not in the heap, so that will not help. We arrange to call
+	// memmove and typeBitsBulkBarrier instead.
+	memmove(sg.elem, elem, c.elemtype.size)
+	typeBitsBulkBarrier(c.elemtype, uintptr(sg.elem), c.elemtype.size)
+	sg.elem = nil
 }
 
 func closechan(c *hchan) {
@@ -309,7 +323,7 @@ func closechan(c *hchan) {
 		if sg.releasetime != 0 {
 			sg.releasetime = cputicks()
 		}
-		goready(gp)
+		goready(gp, 3)
 	}
 
 	// release all writers
@@ -324,7 +338,7 @@ func closechan(c *hchan) {
 		if sg.releasetime != 0 {
 			sg.releasetime = cputicks()
 		}
-		goready(gp)
+		goready(gp, 3)
 	}
 	unlock(&c.lock)
 }
@@ -357,7 +371,7 @@ func chanrecv(t *chantype, c *hchan, ep unsafe.Pointer, block bool) (selected, r
 		if !block {
 			return
 		}
-		gopark(nil, nil, "chan receive (nil chan)", traceEvGoStop)
+		gopark(nil, nil, "chan receive (nil chan)", traceEvGoStop, 2)
 		throw("unreachable")
 	}
 
@@ -406,7 +420,7 @@ func chanrecv(t *chantype, c *hchan, ep unsafe.Pointer, block bool) (selected, r
 			if sg.releasetime != 0 {
 				sg.releasetime = cputicks()
 			}
-			goready(gp)
+			goready(gp, 3)
 			selected = true
 			received = true
 			return
@@ -431,7 +445,7 @@ func chanrecv(t *chantype, c *hchan, ep unsafe.Pointer, block bool) (selected, r
 		mysg.selectdone = nil
 		gp.param = nil
 		c.recvq.enqueue(mysg)
-		goparkunlock(&c.lock, "chan receive", traceEvGoBlockRecv)
+		goparkunlock(&c.lock, "chan receive", traceEvGoBlockRecv, 3)
 
 		// someone woke us up
 		if mysg != gp.waiting {
@@ -462,7 +476,7 @@ func chanrecv(t *chantype, c *hchan, ep unsafe.Pointer, block bool) (selected, r
 	// asynchronous channel
 	// wait for some data to appear
 	var t1 int64
-	for c.qcount <= 0 {
+	for futile := byte(0); c.qcount <= 0; futile = traceFutileWakeup {
 		if c.closed != 0 {
 			selected, received = recvclosed(c, ep)
 			if t1 > 0 {
@@ -488,7 +502,7 @@ func chanrecv(t *chantype, c *hchan, ep unsafe.Pointer, block bool) (selected, r
 		mysg.selectdone = nil
 
 		c.recvq.enqueue(mysg)
-		goparkunlock(&c.lock, "chan receive", traceEvGoBlockRecv)
+		goparkunlock(&c.lock, "chan receive", traceEvGoBlockRecv|futile, 3)
 
 		// someone woke us up - try again
 		if mysg.releasetime > 0 {
@@ -521,7 +535,7 @@ func chanrecv(t *chantype, c *hchan, ep unsafe.Pointer, block bool) (selected, r
 		if sg.releasetime != 0 {
 			sg.releasetime = cputicks()
 		}
-		goready(gp)
+		goready(gp, 3)
 	} else {
 		unlock(&c.lock)
 	}

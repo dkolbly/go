@@ -98,7 +98,7 @@ func setinclude(p string) {
 }
 
 func errorexit() {
-	obj.Bflush(&bstdout)
+	bstdout.Flush()
 	if outfile != "" {
 		os.Remove(outfile)
 	}
@@ -149,7 +149,7 @@ func newfile(s string, f *os.File) {
 	}
 
 	fi.P = nil
-	obj.Linklinehist(Ctxt, int(Lineno), s, 0)
+	Ctxt.LineHist.Push(int(Lineno), s)
 }
 
 var thetext *obj.LSym
@@ -630,7 +630,7 @@ loop:
 	n, _ = i.F.Read(i.B[:])
 	if n == 0 {
 		i.F.Close()
-		obj.Linklinehist(Ctxt, int(Lineno), "<pop>", 0)
+		Ctxt.LineHist.Pop(int(Lineno))
 		goto pop
 	}
 	fi.P = i.B[1:n]

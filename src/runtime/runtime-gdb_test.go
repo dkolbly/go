@@ -31,7 +31,10 @@ func main() {
 	mapvar := make(map[string]string,5)
 	mapvar["abc"] = "def"
 	mapvar["ghi"] = "jkl"
-	fmt.Println("hi") // line 8
+	strvar := "abc"
+	ptrvar := &strvar
+	fmt.Println("hi") // line 10
+	_ = ptrvar
 }
 `
 
@@ -56,14 +59,14 @@ func TestGdbPython(t *testing.T) {
 
 	cmd := exec.Command("go", "build", "-o", "a.exe")
 	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
+	out, err := testEnv(cmd).CombinedOutput()
 	if err != nil {
 		t.Fatalf("building source %v\n%s", err, out)
 	}
 
-	got, _ := exec.Command("gdb", "-nx", "-q", "--batch", "-iex",
+	args := []string{"-nx", "-q", "--batch", "-iex",
 		fmt.Sprintf("add-auto-load-safe-path %s/src/runtime", runtime.GOROOT()),
-		"-ex", "br main.go:8",
+		"-ex", "br main.go:10",
 		"-ex", "run",
 		"-ex", "echo BEGIN info goroutines\n",
 		"-ex", "info goroutines",
@@ -71,10 +74,40 @@ func TestGdbPython(t *testing.T) {
 		"-ex", "echo BEGIN print mapvar\n",
 		"-ex", "print mapvar",
 		"-ex", "echo END\n",
-		filepath.Join(dir, "a.exe")).CombinedOutput()
+		"-ex", "echo BEGIN print strvar\n",
+		"-ex", "print strvar",
+		"-ex", "echo END\n",
+		"-ex", "echo BEGIN print ptrvar\n",
+		"-ex", "print ptrvar",
+		"-ex", "echo END\n"}
+
+	// without framepointer, gdb cannot backtrace our non-standard
+	// stack frames on RISC architectures.
+	canBackTrace := false
+	switch runtime.GOARCH {
+	case "amd64", "386", "ppc64", "ppc64le", "arm", "arm64":
+		canBackTrace = true
+		args = append(args,
+			"-ex", "echo BEGIN goroutine 2 bt\n",
+			"-ex", "goroutine 2 bt",
+			"-ex", "echo END\n")
+	}
+
+	args = append(args, filepath.Join(dir, "a.exe"))
+	got, _ := exec.Command("gdb", args...).CombinedOutput()
 
 	firstLine := bytes.SplitN(got, []byte("\n"), 2)[0]
 	if string(firstLine) != "Loading Go Runtime support." {
+		// This can happen when using all.bash with
+		// GOROOT_FINAL set, because the tests are run before
+		// the final installation of the files.
+		cmd := exec.Command("go", "env", "GOROOT")
+		cmd.Env = []string{}
+		out, err := cmd.CombinedOutput()
+		if err != nil && bytes.Contains(out, []byte("cannot find GOROOT")) {
+			t.Skipf("skipping because GOROOT=%s does not exist", runtime.GOROOT())
+		}
+
 		t.Fatalf("failed to load Go runtime support: %s", firstLine)
 	}
 
@@ -93,5 +126,21 @@ func TestGdbPython(t *testing.T) {
 	printMapvarRe := regexp.MustCompile(`\Q = map[string]string = {["abc"] = "def", ["ghi"] = "jkl"}\E$`)
 	if bl := blocks["print mapvar"]; !printMapvarRe.MatchString(bl) {
 		t.Fatalf("print mapvar failed: %s", bl)
+	}
+
+	strVarRe := regexp.MustCompile(`\Q = "abc"\E$`)
+	if bl := blocks["print strvar"]; !strVarRe.MatchString(bl) {
+		t.Fatalf("print strvar failed: %s", bl)
+	}
+
+	if bl := blocks["print ptrvar"]; !strVarRe.MatchString(bl) {
+		t.Fatalf("print ptrvar failed: %s", bl)
+	}
+
+	btGoroutineRe := regexp.MustCompile(`^#0\s+runtime.+at`)
+	if bl := blocks["goroutine 2 bt"]; canBackTrace && !btGoroutineRe.MatchString(bl) {
+		t.Fatalf("goroutine 2 bt failed: %s", bl)
+	} else if !canBackTrace {
+		t.Logf("gdb cannot backtrace for GOARCH=%s, skipped goroutine backtrace test", runtime.GOARCH)
 	}
 }

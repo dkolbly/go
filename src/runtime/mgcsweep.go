@@ -48,7 +48,7 @@ func bgsweep(c chan int) {
 	lock(&sweep.lock)
 	sweep.parked = true
 	c <- 1
-	goparkunlock(&sweep.lock, "GC sweep wait", traceEvGoBlock)
+	goparkunlock(&sweep.lock, "GC sweep wait", traceEvGoBlock, 1)
 
 	for {
 		for gosweepone() != ^uintptr(0) {
@@ -64,7 +64,7 @@ func bgsweep(c chan int) {
 			continue
 		}
 		sweep.parked = true
-		goparkunlock(&sweep.lock, "GC sweep wait", traceEvGoBlock)
+		goparkunlock(&sweep.lock, "GC sweep wait", traceEvGoBlock, 1)
 	}
 }
 
@@ -165,6 +165,8 @@ func mSpan_Sweep(s *mspan, preserve bool) bool {
 		traceGCSweepStart()
 	}
 
+	xadd64(&mheap_.pagesSwept, int64(s.npages))
+
 	cl := s.sizeclass
 	size := s.elemsize
 	res := false
@@ -173,10 +175,16 @@ func mSpan_Sweep(s *mspan, preserve bool) bool {
 	var head, end gclinkptr
 
 	c := _g_.m.mcache
-	sweepgenset := false
+	freeToHeap := false
 
 	// Mark any free objects in this span so we don't collect them.
+	sstart := uintptr(s.start << _PageShift)
 	for link := s.freelist; link.ptr() != nil; link = link.ptr().next {
+		if uintptr(link) < sstart || s.limit <= uintptr(link) {
+			// Free list is corrupted.
+			dumpFreeList(s)
+			throw("free list corrupted")
+		}
 		heapBitsForAddr(uintptr(link)).setMarkedNonAtomic()
 	}
 
@@ -229,37 +237,10 @@ func mSpan_Sweep(s *mspan, preserve bool) bool {
 
 			// important to set sweepgen before returning it to heap
 			atomicstore(&s.sweepgen, sweepgen)
-			sweepgenset = true
 
-			// NOTE(rsc,dvyukov): The original implementation of efence
-			// in CL 22060046 used SysFree instead of SysFault, so that
-			// the operating system would eventually give the memory
-			// back to us again, so that an efence program could run
-			// longer without running out of memory. Unfortunately,
-			// calling SysFree here without any kind of adjustment of the
-			// heap data structures means that when the memory does
-			// come back to us, we have the wrong metadata for it, either in
-			// the MSpan structures or in the garbage collection bitmap.
-			// Using SysFault here means that the program will run out of
-			// memory fairly quickly in efence mode, but at least it won't
-			// have mysterious crashes due to confused memory reuse.
-			// It should be possible to switch back to SysFree if we also
-			// implement and then call some kind of MHeap_DeleteSpan.
-			if debug.efence > 0 {
-				s.limit = 0 // prevent mlookup from finding this span
-				sysFault(unsafe.Pointer(p), size)
-			} else {
-				mHeap_Free(&mheap_, s, 1)
-			}
-			c.local_nlargefree++
-			c.local_largefree += size
-			reduction := int64(size) * int64(gcpercent+100) / 100
-			if int64(memstats.next_gc)-reduction > int64(heapminimum) {
-				xadd64(&memstats.next_gc, -reduction)
-			} else {
-				atomicstore64(&memstats.next_gc, heapminimum)
-			}
-			res = true
+			// Free the span after heapBitsSweepSpan
+			// returns, since it's not done with the span.
+			freeToHeap = true
 		} else {
 			// Free small object.
 			if size > 2*ptrSize {
@@ -283,7 +264,10 @@ func mSpan_Sweep(s *mspan, preserve bool) bool {
 	// But we need to set it before we make the span available for allocation
 	// (return it to heap or mcentral), because allocation code assumes that a
 	// span is already swept if available for allocation.
-	if !sweepgenset && nfree == 0 {
+	//
+	// TODO(austin): Clean this up by consolidating atomicstore in
+	// large span path above with this.
+	if !freeToHeap && nfree == 0 {
 		// The span must be in our exclusive ownership until we update sweepgen,
 		// check for potential races.
 		if s.state != mSpanInUse || s.sweepgen != sweepgen-1 {
@@ -294,19 +278,61 @@ func mSpan_Sweep(s *mspan, preserve bool) bool {
 	}
 	if nfree > 0 {
 		c.local_nsmallfree[cl] += uintptr(nfree)
-		c.local_cachealloc -= intptr(uintptr(nfree) * size)
-		reduction := int64(nfree) * int64(size) * int64(gcpercent+100) / 100
-		if int64(memstats.next_gc)-reduction > int64(heapminimum) {
-			xadd64(&memstats.next_gc, -reduction)
-		} else {
-			atomicstore64(&memstats.next_gc, heapminimum)
-		}
 		res = mCentral_FreeSpan(&mheap_.central[cl].mcentral, s, int32(nfree), head, end, preserve)
 		// MCentral_FreeSpan updates sweepgen
+	} else if freeToHeap {
+		// Free large span to heap
+
+		// NOTE(rsc,dvyukov): The original implementation of efence
+		// in CL 22060046 used SysFree instead of SysFault, so that
+		// the operating system would eventually give the memory
+		// back to us again, so that an efence program could run
+		// longer without running out of memory. Unfortunately,
+		// calling SysFree here without any kind of adjustment of the
+		// heap data structures means that when the memory does
+		// come back to us, we have the wrong metadata for it, either in
+		// the MSpan structures or in the garbage collection bitmap.
+		// Using SysFault here means that the program will run out of
+		// memory fairly quickly in efence mode, but at least it won't
+		// have mysterious crashes due to confused memory reuse.
+		// It should be possible to switch back to SysFree if we also
+		// implement and then call some kind of MHeap_DeleteSpan.
+		if debug.efence > 0 {
+			s.limit = 0 // prevent mlookup from finding this span
+			sysFault(unsafe.Pointer(uintptr(s.start<<_PageShift)), size)
+		} else {
+			mHeap_Free(&mheap_, s, 1)
+		}
+		c.local_nlargefree++
+		c.local_largefree += size
+		res = true
 	}
 	if trace.enabled {
 		traceGCSweepDone()
-		traceNextGC()
 	}
 	return res
+}
+
+func dumpFreeList(s *mspan) {
+	printlock()
+	print("runtime: free list of span ", s, ":\n")
+	sstart := uintptr(s.start << _PageShift)
+	link := s.freelist
+	for i := 0; i < int(s.npages*_PageSize/s.elemsize); i++ {
+		if i != 0 {
+			print(" -> ")
+		}
+		print(hex(link))
+		if link.ptr() == nil {
+			break
+		}
+		if uintptr(link) < sstart || s.limit <= uintptr(link) {
+			// Bad link. Stop walking before we crash.
+			print(" (BAD)")
+			break
+		}
+		link = link.ptr().next
+	}
+	print("\n")
+	printunlock()
 }

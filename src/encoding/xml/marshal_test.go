@@ -174,6 +174,11 @@ type XMLNameWithTag struct {
 	Value   string `xml:",chardata"`
 }
 
+type XMLNameWithNSTag struct {
+	XMLName Name   `xml:"ns InXMLNameWithNSTag"`
+	Value   string `xml:",chardata"`
+}
+
 type XMLNameWithoutTag struct {
 	XMLName Name
 	Value   string `xml:",chardata"`
@@ -302,8 +307,7 @@ func (m *MyMarshalerTest) MarshalXML(e *Encoder, start StartElement) error {
 	return nil
 }
 
-type MyMarshalerAttrTest struct {
-}
+type MyMarshalerAttrTest struct{}
 
 var _ MarshalerAttr = (*MyMarshalerAttrTest)(nil)
 
@@ -311,8 +315,20 @@ func (m *MyMarshalerAttrTest) MarshalXMLAttr(name Name) (Attr, error) {
 	return Attr{name, "hello world"}, nil
 }
 
+type MyMarshalerValueAttrTest struct{}
+
+var _ MarshalerAttr = MyMarshalerValueAttrTest{}
+
+func (m MyMarshalerValueAttrTest) MarshalXMLAttr(name Name) (Attr, error) {
+	return Attr{name, "hello world"}, nil
+}
+
 type MarshalerStruct struct {
 	Foo MyMarshalerAttrTest `xml:",attr"`
+}
+
+type MarshalerValueStruct struct {
+	Foo MyMarshalerValueAttrTest `xml:",attr"`
 }
 
 type InnerStruct struct {
@@ -338,6 +354,44 @@ type OuterNamedOrderedStruct struct {
 
 type OuterOuterStruct struct {
 	OuterStruct
+}
+
+type NestedAndChardata struct {
+	AB       []string `xml:"A>B"`
+	Chardata string   `xml:",chardata"`
+}
+
+type NestedAndComment struct {
+	AB      []string `xml:"A>B"`
+	Comment string   `xml:",comment"`
+}
+
+type XMLNSFieldStruct struct {
+	Ns   string `xml:"xmlns,attr"`
+	Body string
+}
+
+type NamedXMLNSFieldStruct struct {
+	XMLName struct{} `xml:"testns test"`
+	Ns      string   `xml:"xmlns,attr"`
+	Body    string
+}
+
+type XMLNSFieldStructWithOmitEmpty struct {
+	Ns   string `xml:"xmlns,attr,omitempty"`
+	Body string
+}
+
+type NamedXMLNSFieldStructWithEmptyNamespace struct {
+	XMLName struct{} `xml:"test"`
+	Ns      string   `xml:"xmlns,attr"`
+	Body    string
+}
+
+type RecursiveXMLNSFieldStruct struct {
+	Ns   string                     `xml:"xmlns,attr"`
+	Body *RecursiveXMLNSFieldStruct `xml:",omitempty"`
+	Text string                     `xml:",omitempty"`
 }
 
 func ifaceptr(x interface{}) interface{} {
@@ -980,6 +1034,10 @@ var marshalTests = []struct {
 		Value:     &MarshalerStruct{},
 	},
 	{
+		ExpectXML: `<MarshalerValueStruct Foo="hello world"></MarshalerValueStruct>`,
+		Value:     &MarshalerValueStruct{},
+	},
+	{
 		ExpectXML: `<outer xmlns="testns" int="10"></outer>`,
 		Value:     &OuterStruct{IntAttr: 10},
 	},
@@ -994,6 +1052,47 @@ var marshalTests = []struct {
 	{
 		ExpectXML: `<outer xmlns="testns" int="10"></outer>`,
 		Value:     &OuterOuterStruct{OuterStruct{IntAttr: 10}},
+	},
+	{
+		ExpectXML: `<NestedAndChardata><A><B></B><B></B></A>test</NestedAndChardata>`,
+		Value:     &NestedAndChardata{AB: make([]string, 2), Chardata: "test"},
+	},
+	{
+		ExpectXML: `<NestedAndComment><A><B></B><B></B></A><!--test--></NestedAndComment>`,
+		Value:     &NestedAndComment{AB: make([]string, 2), Comment: "test"},
+	},
+	{
+		ExpectXML: `<XMLNSFieldStruct xmlns="http://example.com/ns"><Body>hello world</Body></XMLNSFieldStruct>`,
+		Value:     &XMLNSFieldStruct{Ns: "http://example.com/ns", Body: "hello world"},
+	},
+	{
+		ExpectXML: `<testns:test xmlns:testns="testns" xmlns="http://example.com/ns"><Body>hello world</Body></testns:test>`,
+		Value:     &NamedXMLNSFieldStruct{Ns: "http://example.com/ns", Body: "hello world"},
+	},
+	{
+		ExpectXML: `<testns:test xmlns:testns="testns"><Body>hello world</Body></testns:test>`,
+		Value:     &NamedXMLNSFieldStruct{Ns: "", Body: "hello world"},
+	},
+	{
+		ExpectXML: `<XMLNSFieldStructWithOmitEmpty><Body>hello world</Body></XMLNSFieldStructWithOmitEmpty>`,
+		Value:     &XMLNSFieldStructWithOmitEmpty{Body: "hello world"},
+	},
+	{
+		// The xmlns attribute must be ignored because the <test>
+		// element is in the empty namespace, so it's not possible
+		// to set the default namespace to something non-empty.
+		ExpectXML:   `<test><Body>hello world</Body></test>`,
+		Value:       &NamedXMLNSFieldStructWithEmptyNamespace{Ns: "foo", Body: "hello world"},
+		MarshalOnly: true,
+	},
+	{
+		ExpectXML: `<RecursiveXMLNSFieldStruct xmlns="foo"><Body xmlns=""><Text>hello world</Text></Body></RecursiveXMLNSFieldStruct>`,
+		Value: &RecursiveXMLNSFieldStruct{
+			Ns: "foo",
+			Body: &RecursiveXMLNSFieldStruct{
+				Text: "hello world",
+			},
+		},
 	},
 }
 
@@ -1217,6 +1316,100 @@ func TestMarshalFlush(t *testing.T) {
 	}
 }
 
+var encodeElementTests = []struct {
+	desc      string
+	value     interface{}
+	start     StartElement
+	expectXML string
+}{{
+	desc:  "simple string",
+	value: "hello",
+	start: StartElement{
+		Name: Name{Local: "a"},
+	},
+	expectXML: `<a>hello</a>`,
+}, {
+	desc:  "string with added attributes",
+	value: "hello",
+	start: StartElement{
+		Name: Name{Local: "a"},
+		Attr: []Attr{{
+			Name:  Name{Local: "x"},
+			Value: "y",
+		}, {
+			Name:  Name{Local: "foo"},
+			Value: "bar",
+		}},
+	},
+	expectXML: `<a x="y" foo="bar">hello</a>`,
+}, {
+	desc: "start element with default name space",
+	value: struct {
+		Foo XMLNameWithNSTag
+	}{
+		Foo: XMLNameWithNSTag{
+			Value: "hello",
+		},
+	},
+	start: StartElement{
+		Name: Name{Space: "ns", Local: "a"},
+		Attr: []Attr{{
+			Name: Name{Local: "xmlns"},
+			// "ns" is the name space defined in XMLNameWithNSTag
+			Value: "ns",
+		}},
+	},
+	expectXML: `<a xmlns="ns"><InXMLNameWithNSTag>hello</InXMLNameWithNSTag></a>`,
+}, {
+	desc: "start element in name space with different default name space",
+	value: struct {
+		Foo XMLNameWithNSTag
+	}{
+		Foo: XMLNameWithNSTag{
+			Value: "hello",
+		},
+	},
+	start: StartElement{
+		Name: Name{Space: "ns2", Local: "a"},
+		Attr: []Attr{{
+			Name: Name{Local: "xmlns"},
+			// "ns" is the name space defined in XMLNameWithNSTag
+			Value: "ns",
+		}},
+	},
+	expectXML: `<ns2:a xmlns:ns2="ns2" xmlns="ns"><InXMLNameWithNSTag>hello</InXMLNameWithNSTag></ns2:a>`,
+}, {
+	desc:  "XMLMarshaler with start element with default name space",
+	value: &MyMarshalerTest{},
+	start: StartElement{
+		Name: Name{Space: "ns2", Local: "a"},
+		Attr: []Attr{{
+			Name: Name{Local: "xmlns"},
+			// "ns" is the name space defined in XMLNameWithNSTag
+			Value: "ns",
+		}},
+	},
+	expectXML: `<ns2:a xmlns:ns2="ns2" xmlns="ns">hello world</ns2:a>`,
+}}
+
+func TestEncodeElement(t *testing.T) {
+	for idx, test := range encodeElementTests {
+		var buf bytes.Buffer
+		enc := NewEncoder(&buf)
+		err := enc.EncodeElement(test.value, test.start)
+		if err != nil {
+			t.Fatalf("enc.EncodeElement: %v", err)
+		}
+		err = enc.Flush()
+		if err != nil {
+			t.Fatalf("enc.Flush: %v", err)
+		}
+		if got, want := buf.String(), test.expectXML; got != want {
+			t.Errorf("#%d(%s): EncodeElement(%#v, %#v):\nhave %#q\nwant %#q", idx, test.desc, test.value, test.start, got, want)
+		}
+	}
+}
+
 func BenchmarkMarshal(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
@@ -1297,7 +1490,7 @@ var encodeTokenTests = []struct {
 	toks: []Token{
 		CharData(" \t\n"),
 	},
-	want: ` &#x9;&#xA;`,
+	want: " &#x9;\n",
 }, {
 	desc: "comment",
 	toks: []Token{
@@ -1335,11 +1528,17 @@ var encodeTokenTests = []struct {
 	},
 	want: `<!foo>`,
 }, {
+	desc: "more complex directive",
+	toks: []Token{
+		Directive("DOCTYPE doc [ <!ELEMENT doc '>'> <!-- com>ment --> ]"),
+	},
+	want: `<!DOCTYPE doc [ <!ELEMENT doc '>'> <!-- com>ment --> ]>`,
+}, {
 	desc: "directive instruction with bad name",
 	toks: []Token{
 		Directive("foo>"),
 	},
-	err: "xml: EncodeToken of Directive containing > marker",
+	err: "xml: EncodeToken of Directive containing wrong < or > markers",
 }, {
 	desc: "end tag without start tag",
 	toks: []Token{
@@ -1674,4 +1873,36 @@ func TestRace9796(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestIsValidDirective(t *testing.T) {
+	testOK := []string{
+		"<>",
+		"< < > >",
+		"<!DOCTYPE '<' '>' '>' <!--nothing-->>",
+		"<!DOCTYPE doc [ <!ELEMENT doc ANY> <!ELEMENT doc ANY> ]>",
+		"<!DOCTYPE doc [ <!ELEMENT doc \"ANY> '<' <!E\" LEMENT '>' doc ANY> ]>",
+		"<!DOCTYPE doc <!-- just>>>> a < comment --> [ <!ITEM anything> ] >",
+	}
+	testKO := []string{
+		"<",
+		">",
+		"<!--",
+		"-->",
+		"< > > < < >",
+		"<!dummy <!-- > -->",
+		"<!DOCTYPE doc '>",
+		"<!DOCTYPE doc '>'",
+		"<!DOCTYPE doc <!--comment>",
+	}
+	for _, s := range testOK {
+		if !isValidDirective(Directive(s)) {
+			t.Errorf("Directive %q is expected to be valid", s)
+		}
+	}
+	for _, s := range testKO {
+		if isValidDirective(Directive(s)) {
+			t.Errorf("Directive %q is expected to be invalid", s)
+		}
+	}
 }

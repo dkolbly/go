@@ -12,8 +12,17 @@ func runtime_init()
 //go:linkname main_init main.init
 func main_init()
 
+// main_init_done is a signal used by cgocallbackg that initialization
+// has been completed. It is made before _cgo_notify_runtime_init_done,
+// so all cgo calls can rely on it existing. When main_init is complete,
+// it is closed, meaning cgocallbackg can reliably receive from it.
+var main_init_done chan bool
+
 //go:linkname main_main main.main
 func main_main()
+
+// runtimeInitTime is the nanotime() at which the runtime started.
+var runtimeInitTime int64
 
 // The main goroutine.
 func main() {
@@ -31,6 +40,9 @@ func main() {
 	} else {
 		maxstacksize = 250000000
 	}
+
+	// Record when the world started.
+	runtimeInitTime = nanotime()
 
 	systemstack(func() {
 		newm(sysmon, nil)
@@ -60,6 +72,7 @@ func main() {
 
 	gcenable()
 
+	main_init_done = make(chan bool)
 	if iscgo {
 		if _cgo_thread_start == nil {
 			throw("_cgo_thread_start missing")
@@ -78,13 +91,23 @@ func main() {
 				throw("_cgo_unsetenv missing")
 			}
 		}
+		if _cgo_notify_runtime_init_done == nil {
+			throw("_cgo_notify_runtime_init_done missing")
+		}
+		cgocall(_cgo_notify_runtime_init_done, nil)
 	}
 
 	main_init()
+	close(main_init_done)
 
 	needUnlock = false
 	unlockOSThread()
 
+	if isarchive || islibrary {
+		// A program compiled with -buildmode=c-archive or c-shared
+		// has a main, but it is not executed.
+		return
+	}
 	main_main()
 	if raceenabled {
 		racefini()
@@ -95,13 +118,21 @@ func main() {
 	// let the other goroutine finish printing the panic trace.
 	// Once it does, it will exit. See issue 3934.
 	if panicking != 0 {
-		gopark(nil, nil, "panicwait", traceEvGoStop)
+		gopark(nil, nil, "panicwait", traceEvGoStop, 1)
 	}
 
 	exit(0)
 	for {
 		var x *int32
 		*x = 0
+	}
+}
+
+// os_beforeExit is called from os.Exit(0).
+//go:linkname os_beforeExit os.runtime_beforeExit
+func os_beforeExit() {
+	if raceenabled {
+		racefini()
 	}
 }
 
@@ -118,12 +149,12 @@ func forcegchelper() {
 			throw("forcegc: phase error")
 		}
 		atomicstore(&forcegc.idle, 1)
-		goparkunlock(&forcegc.lock, "force gc (idle)", traceEvGoBlock)
+		goparkunlock(&forcegc.lock, "force gc (idle)", traceEvGoBlock, 1)
 		// this goroutine is explicitly resumed by sysmon
 		if debug.gctrace > 0 {
 			println("GC forced")
 		}
-		startGC(gcForceMode)
+		startGC(gcBackgroundMode)
 	}
 }
 
@@ -137,7 +168,7 @@ func Gosched() {
 
 // Puts the current goroutine into a waiting state and calls unlockf.
 // If unlockf returns false, the goroutine is resumed.
-func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason string, traceEv byte) {
+func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason string, traceEv byte, traceskip int) {
 	mp := acquirem()
 	gp := mp.curg
 	status := readgstatus(gp)
@@ -148,6 +179,7 @@ func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason s
 	mp.waitunlockf = *(*unsafe.Pointer)(unsafe.Pointer(&unlockf))
 	gp.waitreason = reason
 	mp.waittraceev = traceEv
+	mp.waittraceskip = traceskip
 	releasem(mp)
 	// can't do anything that might move the G between Ms here.
 	mcall(park_m)
@@ -155,13 +187,13 @@ func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason s
 
 // Puts the current goroutine into a waiting state and unlocks the lock.
 // The goroutine can be made runnable again by calling goready(gp).
-func goparkunlock(lock *mutex, reason string, traceEv byte) {
-	gopark(parkunlock_c, unsafe.Pointer(lock), reason, traceEv)
+func goparkunlock(lock *mutex, reason string, traceEv byte, traceskip int) {
+	gopark(parkunlock_c, unsafe.Pointer(lock), reason, traceEv, traceskip)
 }
 
-func goready(gp *g) {
+func goready(gp *g, traceskip int) {
 	systemstack(func() {
-		ready(gp)
+		ready(gp, traceskip)
 	})
 }
 
@@ -171,12 +203,12 @@ func acquireSudog() *sudog {
 	// acquireSudog, acquireSudog calls new(sudog),
 	// new calls malloc, malloc can call the garbage collector,
 	// and the garbage collector calls the semaphore implementation
-	// in stoptheworld.
+	// in stopTheWorld.
 	// Break the cycle by doing acquirem/releasem around new(sudog).
 	// The acquirem/releasem increments m.locks during new(sudog),
 	// which keeps the garbage collector from being invoked.
 	mp := acquirem()
-	pp := mp.p
+	pp := mp.p.ptr()
 	if len(pp.sudogcache) == 0 {
 		lock(&sched.sudoglock)
 		// First, try to grab a batch from central cache.
@@ -225,7 +257,7 @@ func releaseSudog(s *sudog) {
 		throw("runtime: releaseSudog with non-nil gp.param")
 	}
 	mp := acquirem() // avoid rescheduling to another P
-	pp := mp.p
+	pp := mp.p.ptr()
 	if len(pp.sudogcache) == cap(pp.sudogcache) {
 		// Transfer half of local cache to the central cache.
 		var first, last *sudog

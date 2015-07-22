@@ -33,9 +33,11 @@ func init() {
 	cmdTest.Run = runTest
 }
 
+const testUsage = "test [-c] [-i] [build and test flags] [packages] [flags for test binary]"
+
 var cmdTest = &Command{
 	CustomFlags: true,
-	UsageLine:   "test [-c] [-i] [build and test flags] [packages] [flags for test binary]",
+	UsageLine:   testUsage,
 	Short:       "test packages",
 	Long: `
 'Go test' automates testing the packages named by the import paths.
@@ -64,6 +66,21 @@ with source in the current directory, including tests, and runs the tests.
 The package is built in a temporary directory so it does not interfere with the
 non-test installation.
 
+` + strings.TrimSpace(testFlag1) + ` See 'go help testflag' for details.
+
+If the test binary needs any other flags, they should be presented after the
+package names. The go tool treats as a flag the first argument that begins with
+a minus sign that it does not recognize itself; that argument and all subsequent
+arguments are passed as arguments to the test binary.
+
+For more about build flags, see 'go help build'.
+For more about specifying packages, see 'go help packages'.
+
+See also: go build, go vet.
+`,
+}
+
+const testFlag1 = `
 In addition to the build flags, the flags handled by 'go test' itself are:
 
 	-c
@@ -83,21 +100,9 @@ In addition to the build flags, the flags handled by 'go test' itself are:
 		Compile the test binary to the named file.
 		The test still runs (unless -c or -i is specified).
 
-
 The test binary also accepts flags that control execution of the test; these
-flags are also accessible by 'go test'.  See 'go help testflag' for details.
-
-If the test binary needs any other flags, they should be presented after the
-package names. The go tool treats as a flag the first argument that begins with
-a minus sign that it does not recognize itself; that argument and all subsequent
-arguments are passed as arguments to the test binary.
-
-For more about build flags, see 'go help build'.
-For more about specifying packages, see 'go help packages'.
-
-See also: go build, go vet.
-`,
-}
+flags are also accessible by 'go test'.
+`
 
 var helpTestflag = &Command{
 	UsageLine: "testflag",
@@ -107,13 +112,18 @@ The 'go test' command takes both flags that apply to 'go test' itself
 and flags that apply to the resulting test binary.
 
 Several of the flags control profiling and write an execution profile
-suitable for "go tool pprof"; run "go tool pprof help" for more
+suitable for "go tool pprof"; run "go tool pprof -h" for more
 information.  The --alloc_space, --alloc_objects, and --show_bytes
 options of pprof control how the information is presented.
 
 The following flags are recognized by the 'go test' command and
 control the execution of any test:
 
+	` + strings.TrimSpace(testFlag2) + `
+`,
+}
+
+const testFlag2 = `
 	-bench regexp
 	    Run benchmarks matching the regular expression.
 	    By default, no benchmarks run. To run all benchmarks,
@@ -135,11 +145,16 @@ control the execution of any test:
 	-blockprofilerate n
 	    Control the detail provided in goroutine blocking profiles by
 	    calling runtime.SetBlockProfileRate with n.
-	    See 'godoc runtime SetBlockProfileRate'.
+	    See 'go doc runtime.SetBlockProfileRate'.
 	    The profiler aims to sample, on average, one blocking event every
 	    n nanoseconds the program spends blocked.  By default,
 	    if -test.blockprofile is set without this flag, all blocking events
 	    are recorded, equivalent to -test.blockprofilerate=1.
+
+	-count n
+	    Run each test and benchmark n times (default 1).
+	    If -cpu is set, run n times for each GOMAXPROCS value.
+	    Examples are always run once.
 
 	-cover
 	    Enable coverage analysis.
@@ -180,7 +195,7 @@ control the execution of any test:
 
 	-memprofilerate n
 	    Enable more precise (and expensive) memory profiles by setting
-	    runtime.MemProfileRate.  See 'godoc runtime MemProfileRate'.
+	    runtime.MemProfileRate.  See 'go doc runtime.MemProfileRate'.
 	    To profile all memory allocations, use -test.memprofilerate=1
 	    and pass --alloc_space flag to the pprof tool.
 
@@ -233,8 +248,7 @@ The test flags that generate profiles (other than for coverage) also
 leave the test binary in pkg.test for use when analyzing the profiles.
 
 Flags not recognized by 'go test' must be placed after any specified packages.
-`,
-}
+`
 
 var helpTestfunc = &Command{
 	UsageLine: "testfunc",
@@ -314,6 +328,7 @@ func runTest(cmd *Command, args []string) {
 	findExecCmd() // initialize cached result
 
 	raceInit()
+	buildModeInit()
 	pkgs := packagesForBuild(pkgArgs)
 	if len(pkgs) == 0 {
 		fatalf("no packages to test")
@@ -380,7 +395,7 @@ func runTest(cmd *Command, args []string) {
 		if deps["C"] {
 			delete(deps, "C")
 			deps["runtime/cgo"] = true
-			if buildContext.GOOS == runtime.GOOS && buildContext.GOARCH == runtime.GOARCH {
+			if goos == runtime.GOOS && goarch == runtime.GOARCH && !buildRace {
 				deps["cmd/cgo"] = true
 			}
 		}
@@ -429,6 +444,10 @@ func runTest(cmd *Command, args []string) {
 
 		// Mark all the coverage packages for rebuilding with coverage.
 		for _, p := range testCoverPkgs {
+			// There is nothing to cover in package unsafe; it comes from the compiler.
+			if p.ImportPath == "unsafe" {
+				continue
+			}
 			p.Stale = true // rebuild
 			p.fake = true  // do not warn about rebuild
 			p.coverMode = testCoverMode
@@ -563,12 +582,17 @@ func (b *builder) test(p *Package) (buildAction, runAction, printAction *action,
 	var imports, ximports []*Package
 	var stk importStack
 	stk.push(p.ImportPath + " (test)")
-	for _, path := range p.TestImports {
-		p1 := loadImport(path, p.Dir, &stk, p.build.TestImportPos[path])
+	for i, path := range p.TestImports {
+		p1 := loadImport(path, p.Dir, p, &stk, p.build.TestImportPos[path])
 		if p1.Error != nil {
 			return nil, nil, nil, p1.Error
 		}
-		if contains(p1.Deps, p.ImportPath) {
+		if len(p1.DepsErrors) > 0 {
+			err := p1.DepsErrors[0]
+			err.Pos = "" // show full import stack
+			return nil, nil, nil, err
+		}
+		if contains(p1.Deps, p.ImportPath) || p1.ImportPath == p.ImportPath {
 			// Same error that loadPackage returns (via reusePackage) in pkg.go.
 			// Can't change that code, because that code is only for loading the
 			// non-test copy of a package.
@@ -579,21 +603,28 @@ func (b *builder) test(p *Package) (buildAction, runAction, printAction *action,
 			}
 			return nil, nil, nil, err
 		}
+		p.TestImports[i] = p1.ImportPath
 		imports = append(imports, p1)
 	}
 	stk.pop()
 	stk.push(p.ImportPath + "_test")
 	pxtestNeedsPtest := false
-	for _, path := range p.XTestImports {
+	for i, path := range p.XTestImports {
 		if path == p.ImportPath {
 			pxtestNeedsPtest = true
 			continue
 		}
-		p1 := loadImport(path, p.Dir, &stk, p.build.XTestImportPos[path])
+		p1 := loadImport(path, p.Dir, p, &stk, p.build.XTestImportPos[path])
 		if p1.Error != nil {
 			return nil, nil, nil, p1.Error
 		}
+		if len(p1.DepsErrors) > 0 {
+			err := p1.DepsErrors[0]
+			err.Pos = "" // show full import stack
+			return nil, nil, nil, err
+		}
 		ximports = append(ximports, p1)
+		p.XTestImports[i] = p1.ImportPath
 	}
 	stk.pop()
 
@@ -687,10 +718,11 @@ func (b *builder) test(p *Package) (buildAction, runAction, printAction *action,
 			build: &build.Package{
 				ImportPos: p.build.XTestImportPos,
 			},
-			imports: ximports,
-			pkgdir:  testDir,
-			fake:    true,
-			Stale:   true,
+			imports:  ximports,
+			pkgdir:   testDir,
+			fake:     true,
+			external: true,
+			Stale:    true,
 		}
 		if pxtestNeedsPtest {
 			pxtest.imports = append(pxtest.imports, ptest)
@@ -717,7 +749,7 @@ func (b *builder) test(p *Package) (buildAction, runAction, printAction *action,
 		if dep == ptest.ImportPath {
 			pmain.imports = append(pmain.imports, ptest)
 		} else {
-			p1 := loadImport(dep, "", &stk, nil)
+			p1 := loadImport(dep, "", nil, &stk, nil)
 			if p1.Error != nil {
 				return nil, nil, nil, p1.Error
 			}

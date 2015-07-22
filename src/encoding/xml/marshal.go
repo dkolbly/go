@@ -173,6 +173,7 @@ func (enc *Encoder) EncodeElement(v interface{}, start StartElement) error {
 }
 
 var (
+	begComment   = []byte("<!--")
 	endComment   = []byte("-->")
 	endProcInst  = []byte("?>")
 	endDirective = []byte(">")
@@ -209,7 +210,7 @@ func (enc *Encoder) EncodeToken(t Token) error {
 			return err
 		}
 	case CharData:
-		EscapeText(p, t)
+		escapeText(p, t, false)
 	case Comment:
 		if bytes.Contains(t, endComment) {
 			return fmt.Errorf("xml: EncodeToken of Comment containing --> marker")
@@ -238,14 +239,54 @@ func (enc *Encoder) EncodeToken(t Token) error {
 		}
 		p.WriteString("?>")
 	case Directive:
-		if bytes.Contains(t, endDirective) {
-			return fmt.Errorf("xml: EncodeToken of Directive containing > marker")
+		if !isValidDirective(t) {
+			return fmt.Errorf("xml: EncodeToken of Directive containing wrong < or > markers")
 		}
 		p.WriteString("<!")
 		p.Write(t)
 		p.WriteString(">")
 	}
 	return p.cachedWriteError()
+}
+
+// isValidDirective reports whether dir is a valid directive text,
+// meaning angle brackets are matched, ignoring comments and strings.
+func isValidDirective(dir Directive) bool {
+	var (
+		depth     int
+		inquote   uint8
+		incomment bool
+	)
+	for i, c := range dir {
+		switch {
+		case incomment:
+			if c == '>' {
+				if n := 1 + i - len(endComment); n >= 0 && bytes.Equal(dir[n:i+1], endComment) {
+					incomment = false
+				}
+			}
+			// Just ignore anything in comment
+		case inquote != 0:
+			if c == inquote {
+				inquote = 0
+			}
+			// Just ignore anything within quotes
+		case c == '\'' || c == '"':
+			inquote = c
+		case c == '<':
+			if i+len(begComment) < len(dir) && bytes.Equal(dir[i:i+len(begComment)], begComment) {
+				incomment = true
+			} else {
+				depth++
+			}
+		case c == '>':
+			if depth == 0 {
+				return false
+			}
+			depth--
+		}
+	}
+	return depth == 0 && inquote == 0 && !incomment
 }
 
 // Flush flushes any buffered XML to the underlying writer.
@@ -578,12 +619,13 @@ func (p *printer) marshalValue(val reflect.Value, finfo *fieldInfo, startTemplat
 	// 3. type name
 	var start StartElement
 
-	// Historic behaviour: elements use the default name space
-	// they are contained in by default.
-	start.Name.Space = p.defaultNS
+	// explicitNS records whether the element's name space has been
+	// explicitly set (for example an XMLName field).
+	explicitNS := false
 
 	if startTemplate != nil {
 		start.Name = startTemplate.Name
+		explicitNS = true
 		start.Attr = append(start.Attr, startTemplate.Attr...)
 	} else if tinfo.xmlname != nil {
 		xmlname := tinfo.xmlname
@@ -592,11 +634,13 @@ func (p *printer) marshalValue(val reflect.Value, finfo *fieldInfo, startTemplat
 		} else if v, ok := xmlname.value(val).Interface().(Name); ok && v.Local != "" {
 			start.Name = v
 		}
+		explicitNS = true
 	}
 	if start.Name.Local == "" && finfo != nil {
 		start.Name.Local = finfo.name
 		if finfo.xmlns != "" {
 			start.Name.Space = finfo.xmlns
+			explicitNS = true
 		}
 	}
 	if start.Name.Local == "" {
@@ -606,9 +650,12 @@ func (p *printer) marshalValue(val reflect.Value, finfo *fieldInfo, startTemplat
 		}
 		start.Name.Local = name
 	}
-	// Historic behaviour: an element that's in a namespace sets
-	// the default namespace for all elements contained within it.
-	start.setDefaultNamespace()
+
+	// defaultNS records the default name space as set by a xmlns="..."
+	// attribute. We don't set p.defaultNS because we want to let
+	// the attribute writing code (in p.defineNS) be solely responsible
+	// for maintaining that.
+	defaultNS := p.defaultNS
 
 	// Attributes
 	for i := range tinfo.fields {
@@ -616,81 +663,26 @@ func (p *printer) marshalValue(val reflect.Value, finfo *fieldInfo, startTemplat
 		if finfo.flags&fAttr == 0 {
 			continue
 		}
-		fv := finfo.value(val)
-		name := Name{Space: finfo.xmlns, Local: finfo.name}
-
-		if finfo.flags&fOmitEmpty != 0 && isEmptyValue(fv) {
-			continue
-		}
-
-		if fv.Kind() == reflect.Interface && fv.IsNil() {
-			continue
-		}
-
-		if fv.CanInterface() && fv.Type().Implements(marshalerAttrType) {
-			attr, err := fv.Interface().(MarshalerAttr).MarshalXMLAttr(name)
-			if err != nil {
-				return err
-			}
-			if attr.Name.Local != "" {
-				start.Attr = append(start.Attr, attr)
-			}
-			continue
-		}
-
-		if fv.CanAddr() {
-			pv := fv.Addr()
-			if pv.CanInterface() && pv.Type().Implements(marshalerAttrType) {
-				attr, err := pv.Interface().(MarshalerAttr).MarshalXMLAttr(name)
-				if err != nil {
-					return err
-				}
-				if attr.Name.Local != "" {
-					start.Attr = append(start.Attr, attr)
-				}
-				continue
-			}
-		}
-
-		if fv.CanInterface() && fv.Type().Implements(textMarshalerType) {
-			text, err := fv.Interface().(encoding.TextMarshaler).MarshalText()
-			if err != nil {
-				return err
-			}
-			start.Attr = append(start.Attr, Attr{name, string(text)})
-			continue
-		}
-
-		if fv.CanAddr() {
-			pv := fv.Addr()
-			if pv.CanInterface() && pv.Type().Implements(textMarshalerType) {
-				text, err := pv.Interface().(encoding.TextMarshaler).MarshalText()
-				if err != nil {
-					return err
-				}
-				start.Attr = append(start.Attr, Attr{name, string(text)})
-				continue
-			}
-		}
-
-		// Dereference or skip nil pointer, interface values.
-		switch fv.Kind() {
-		case reflect.Ptr, reflect.Interface:
-			if fv.IsNil() {
-				continue
-			}
-			fv = fv.Elem()
-		}
-
-		s, b, err := p.marshalSimple(fv.Type(), fv)
+		attr, err := p.fieldAttr(finfo, val)
 		if err != nil {
 			return err
 		}
-		if b != nil {
-			s = string(b)
+		if attr.Name.Local == "" {
+			continue
 		}
-		start.Attr = append(start.Attr, Attr{name, s})
+		start.Attr = append(start.Attr, attr)
+		if attr.Name.Space == "" && attr.Name.Local == "xmlns" {
+			defaultNS = attr.Value
+		}
 	}
+	if !explicitNS {
+		// Historic behavior: elements use the default name space
+		// they are contained in by default.
+		start.Name.Space = defaultNS
+	}
+	// Historic behaviour: an element that's in a namespace sets
+	// the default namespace for all elements contained within it.
+	start.setDefaultNamespace()
 
 	if err := p.writeStart(&start); err != nil {
 		return err
@@ -717,6 +709,65 @@ func (p *printer) marshalValue(val reflect.Value, finfo *fieldInfo, startTemplat
 	}
 
 	return p.cachedWriteError()
+}
+
+// fieldAttr returns the attribute of the given field.
+// If the returned attribute has an empty Name.Local,
+// it should not be used.
+// The given value holds the value containing the field.
+func (p *printer) fieldAttr(finfo *fieldInfo, val reflect.Value) (Attr, error) {
+	fv := finfo.value(val)
+	name := Name{Space: finfo.xmlns, Local: finfo.name}
+	if finfo.flags&fOmitEmpty != 0 && isEmptyValue(fv) {
+		return Attr{}, nil
+	}
+	if fv.Kind() == reflect.Interface && fv.IsNil() {
+		return Attr{}, nil
+	}
+	if fv.CanInterface() && fv.Type().Implements(marshalerAttrType) {
+		attr, err := fv.Interface().(MarshalerAttr).MarshalXMLAttr(name)
+		return attr, err
+	}
+	if fv.CanAddr() {
+		pv := fv.Addr()
+		if pv.CanInterface() && pv.Type().Implements(marshalerAttrType) {
+			attr, err := pv.Interface().(MarshalerAttr).MarshalXMLAttr(name)
+			return attr, err
+		}
+	}
+	if fv.CanInterface() && fv.Type().Implements(textMarshalerType) {
+		text, err := fv.Interface().(encoding.TextMarshaler).MarshalText()
+		if err != nil {
+			return Attr{}, err
+		}
+		return Attr{name, string(text)}, nil
+	}
+	if fv.CanAddr() {
+		pv := fv.Addr()
+		if pv.CanInterface() && pv.Type().Implements(textMarshalerType) {
+			text, err := pv.Interface().(encoding.TextMarshaler).MarshalText()
+			if err != nil {
+				return Attr{}, err
+			}
+			return Attr{name, string(text)}, nil
+		}
+	}
+	// Dereference or skip nil pointer, interface values.
+	switch fv.Kind() {
+	case reflect.Ptr, reflect.Interface:
+		if fv.IsNil() {
+			return Attr{}, nil
+		}
+		fv = fv.Elem()
+	}
+	s, b, err := p.marshalSimple(fv.Type(), fv)
+	if err != nil {
+		return Attr{}, err
+	}
+	if b != nil {
+		s = string(b)
+	}
+	return Attr{name, s}, nil
 }
 
 // defaultStart returns the default start element to use,
@@ -924,6 +975,9 @@ func (p *printer) marshalStruct(tinfo *typeInfo, val reflect.Value) error {
 
 		switch finfo.flags & fMode {
 		case fCharData:
+			if err := s.setParents(&noField, reflect.Value{}); err != nil {
+				return err
+			}
 			if vf.CanInterface() && vf.Type().Implements(textMarshalerType) {
 				data, err := vf.Interface().(encoding.TextMarshaler).MarshalText()
 				if err != nil {
@@ -967,6 +1021,9 @@ func (p *printer) marshalStruct(tinfo *typeInfo, val reflect.Value) error {
 			continue
 
 		case fComment:
+			if err := s.setParents(&noField, reflect.Value{}); err != nil {
+				return err
+			}
 			k := vf.Kind()
 			if !(k == reflect.String || k == reflect.Slice && vf.Type().Elem().Kind() == reflect.Uint8) {
 				return fmt.Errorf("xml: bad type for comment field of %s", val.Type())

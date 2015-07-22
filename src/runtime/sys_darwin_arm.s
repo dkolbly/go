@@ -52,7 +52,7 @@ TEXT runtime·open(SB),NOSPLIT,$0
 	MOVW	R0, ret+12(FP)
 	RET
 
-TEXT runtime·close(SB),NOSPLIT,$0
+TEXT runtime·closefd(SB),NOSPLIT,$0
 	MOVW	fd+0(FP), R0
 	MOVW	$SYS_close, R12
 	SWI	$0x80
@@ -301,6 +301,9 @@ TEXT runtime·cas(SB),NOSPLIT,$0
 TEXT runtime·casp1(SB),NOSPLIT,$0
 	B	runtime·cas(SB)
 
+TEXT ·publicationBarrier(SB),NOSPLIT,$-4-0
+	B	runtime·armPublicationBarrier(SB)
+
 TEXT runtime·sysctl(SB),NOSPLIT,$0
 	MOVW	mib+0(FP), R0
 	MOVW	miblen+4(FP), R1
@@ -320,26 +323,25 @@ sysctl_ret:
 	RET
 
 // Thread related functions
-// void bsdthread_create(void *stk, M *m, G *g, void (*fn)(void))
+// func bsdthread_create(stk, arg unsafe.Pointer, fn uintptr) int32
 TEXT runtime·bsdthread_create(SB),NOSPLIT,$0
 	// Set up arguments to bsdthread_create system call.
 	// The ones in quotes pass through to the thread callback
 	// uninterpreted, so we can put whatever we want there.
-	MOVW    fn+12(FP), R0   // "func"
-	MOVW    mm+4(FP), R1 // "arg"
-	MOVW    stk+0(FP), R2 // stack
-	MOVW    gg+8(FP), R3 // "pthread"
+	MOVW    fn+8(FP),    R0 // "func"
+	MOVW    arg+4(FP),   R1 // "arg"
+	MOVW    stk+0(FP),   R2 // stack
 	MOVW	$0x01000000, R4	// flags = PTHREAD_START_CUSTOM
-	MOVW	$0, R5	// paranoia
+	MOVW	$0,          R5 // paranoia
 	MOVW	$SYS_bsdthread_create, R12
 	SWI	$0x80
 	BCC		create_ret
 	RSB 	$0, R0, R0
-	MOVW	R0, ret+16(FP)
+	MOVW	R0, ret+12(FP)
 	RET
 create_ret:
 	MOVW	$0, R0
-	MOVW	R0, ret+16(FP)
+	MOVW	R0, ret+12(FP)
 	RET
 
 // The thread that bsdthread_create creates starts executing here,

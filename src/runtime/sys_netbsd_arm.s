@@ -33,7 +33,7 @@ TEXT runtime·open(SB),NOSPLIT,$-8
 	MOVW	R0, ret+12(FP)
 	RET
 
-TEXT runtime·close(SB),NOSPLIT,$-8
+TEXT runtime·closefd(SB),NOSPLIT,$-8
 	MOVW fd+0(FP), R0
 	SWI $0xa00006
 	MOVW.CS	$-1, R0
@@ -348,6 +348,10 @@ TEXT runtime·casp1(SB),NOSPLIT,$0
 //		return 0;
 TEXT runtime·cas(SB),NOSPLIT,$0
 	B runtime·armcas(SB)
+
+// TODO: this is only valid for ARMv7+
+TEXT ·publicationBarrier(SB),NOSPLIT,$-4-0
+	B	runtime·armPublicationBarrier(SB)
 
 TEXT runtime·read_tls_fallback(SB),NOSPLIT,$-4
 	MOVM.WP [R1, R2, R3, R12], (R13)

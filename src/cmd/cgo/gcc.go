@@ -199,6 +199,10 @@ func (p *Package) loadDefines(f *File) {
 			val = strings.TrimSpace(line[tabIndex:])
 		}
 
+		if key == "__clang__" {
+			p.GccIsClang = true
+		}
+
 		if n := f.Name[key]; n != nil {
 			if *debugDefine {
 				fmt.Fprintf(os.Stderr, "#define %s %s\n", key, val)
@@ -762,7 +766,7 @@ func (p *Package) gccCmd() []string {
 		"-c",          // do not link
 		"-xc",         // input language is C
 	)
-	if strings.Contains(c[0], "clang") {
+	if p.GccIsClang {
 		c = append(c,
 			"-ferror-limit=0",
 			// Apple clang version 1.7 (tags/Apple/clang-77) (based on LLVM 2.9svn)
@@ -777,7 +781,7 @@ func (p *Package) gccCmd() []string {
 			// incorrectly typed unsigned long. We work around that
 			// by disabling the builtin functions (this is safe as
 			// it won't affect the actual compilation of the C code).
-			// See: http://golang.org/issue/6506.
+			// See: https://golang.org/issue/6506.
 			"-fno-builtin",
 		)
 	}
@@ -1042,7 +1046,7 @@ func (tr *TypeRepr) String() string {
 	return fmt.Sprintf(tr.Repr, tr.FormatArgs...)
 }
 
-// Empty returns true if the result of String would be "".
+// Empty reports whether the result of String would be "".
 func (tr *TypeRepr) Empty() bool {
 	return len(tr.Repr) == 0
 }
@@ -1547,7 +1551,7 @@ func (c *typeConv) pad(fld []*ast.Field, size int64) []*ast.Field {
 	return fld
 }
 
-// Struct conversion: return Go and (6g) C syntax for type.
+// Struct conversion: return Go and (gc) C syntax for type.
 func (c *typeConv) Struct(dt *dwarf.StructType, pos token.Pos) (expr *ast.StructType, csyntax string, align int64) {
 	// Minimum alignment for a struct is 1 byte.
 	align = 1

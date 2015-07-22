@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -110,7 +111,7 @@ func run(dir string, mode int, cmd ...string) string {
 		if mode&Background != 0 {
 			bgdied.Done()
 		}
-		fatal("FAILED: %v", strings.Join(cmd, " "))
+		fatal("FAILED: %v: %v", strings.Join(cmd, " "), err)
 	}
 	if mode&ShowOutput != 0 {
 		outputLock.Lock()
@@ -245,14 +246,28 @@ func readfile(file string) string {
 	return string(data)
 }
 
-// writefile writes b to the named file, creating it if needed.  if
-// exec is non-zero, marks the file as executable.
-func writefile(b, file string, exec int) {
+const (
+	writeExec = 1 << iota
+	writeSkipSame
+)
+
+// writefile writes b to the named file, creating it if needed.
+// if exec is non-zero, marks the file as executable.
+// If the file already exists and has the expected content,
+// it is not rewritten, to avoid changing the time stamp.
+func writefile(b, file string, flag int) {
+	new := []byte(b)
+	if flag&writeSkipSame != 0 {
+		old, err := ioutil.ReadFile(file)
+		if err == nil && bytes.Equal(old, new) {
+			return
+		}
+	}
 	mode := os.FileMode(0666)
-	if exec != 0 {
+	if flag&writeExec != 0 {
 		mode = 0777
 	}
-	err := ioutil.WriteFile(file, []byte(b), mode)
+	err := ioutil.WriteFile(file, new, mode)
 	if err != nil {
 		fatal("%v", err)
 	}
@@ -422,6 +437,8 @@ func main() {
 			gohostarch = "386"
 		case strings.Contains(out, "arm"):
 			gohostarch = "arm"
+		case strings.Contains(out, "aarch64"):
+			gohostarch = "arm64"
 		case strings.Contains(out, "ppc64le"):
 			gohostarch = "ppc64le"
 		case strings.Contains(out, "ppc64"):
@@ -478,18 +495,6 @@ func xsamefile(f1, f2 string) bool {
 	return os.SameFile(fi1, fi2)
 }
 
-func cpuid(info *[4]uint32, ax uint32)
-
-func cansse2() bool {
-	if gohostarch != "386" && gohostarch != "amd64" {
-		return false
-	}
-
-	var info [4]uint32
-	cpuid(&info, 1)
-	return info[3]&(1<<26) != 0 // SSE2
-}
-
 func xgetgoarm() string {
 	if goos == "nacl" {
 		// NaCl guarantees VFPv3 and is always cross-compiled.
@@ -505,8 +510,9 @@ func xgetgoarm() string {
 		// Conservative default for cross-compilation.
 		return "5"
 	}
-	if goos == "freebsd" {
+	if goos == "freebsd" || goos == "openbsd" {
 		// FreeBSD has broken VFP support.
+		// OpenBSD currently only supports softfloat.
 		return "5"
 	}
 	if goos != "linux" {

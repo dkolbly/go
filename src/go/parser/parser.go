@@ -7,6 +7,13 @@
 // output is an abstract syntax tree (AST) representing the Go source. The
 // parser is invoked through one of the Parse* functions.
 //
+// The parser accepts a larger language than is syntactically permitted by
+// the Go spec, for simplicity, and for improved robustness in the presence
+// of syntax errors. For instance, in method declarations, the receiver is
+// treated like an ordinary parameter list and thus may contain multiple
+// entries where the spec permits exactly one. Consequently, the corresponding
+// field in the AST (ast.FuncDecl.Recv) field is not restricted to one entry.
+//
 package parser
 
 import (
@@ -412,14 +419,17 @@ func (p *parser) expectSemi() {
 	}
 }
 
-func (p *parser) atComma(context string) bool {
+func (p *parser) atComma(context string, follow token.Token) bool {
 	if p.tok == token.COMMA {
 		return true
 	}
-	if p.tok == token.SEMICOLON && p.lit == "\n" {
-		p.error(p.pos, "missing ',' before newline in "+context)
-		return true // "insert" the comma and continue
-
+	if p.tok != follow {
+		msg := "missing ','"
+		if p.tok == token.SEMICOLON && p.lit == "\n" {
+			msg += " before newline"
+		}
+		p.error(p.pos, msg+" in "+context)
+		return true // "insert" comma and continue
 	}
 	return false
 }
@@ -825,7 +835,7 @@ func (p *parser) parseParameterList(scope *ast.Scope, ellipsisOk bool) (params [
 		// parameter or result variable is the function body.
 		p.declare(field, nil, scope, ast.Var, idents...)
 		p.resolve(typ)
-		if !p.atComma("parameter list") {
+		if !p.atComma("parameter list", token.RPAREN) {
 			return
 		}
 		p.next()
@@ -838,7 +848,7 @@ func (p *parser) parseParameterList(scope *ast.Scope, ellipsisOk bool) (params [
 			// parameter or result variable is the function body.
 			p.declare(field, nil, scope, ast.Var, idents...)
 			p.resolve(typ)
-			if !p.atComma("parameter list") {
+			if !p.atComma("parameter list", token.RPAREN) {
 				break
 			}
 			p.next()
@@ -1248,7 +1258,7 @@ func (p *parser) parseCallOrConversion(fun ast.Expr) *ast.CallExpr {
 			ellipsis = p.pos
 			p.next()
 		}
-		if !p.atComma("argument list") {
+		if !p.atComma("argument list", token.RPAREN) {
 			break
 		}
 		p.next()
@@ -1259,7 +1269,7 @@ func (p *parser) parseCallOrConversion(fun ast.Expr) *ast.CallExpr {
 	return &ast.CallExpr{Fun: fun, Lparen: lparen, Args: list, Ellipsis: ellipsis, Rparen: rparen}
 }
 
-func (p *parser) parseElement(keyOk bool) ast.Expr {
+func (p *parser) parseValue(keyOk bool) ast.Expr {
 	if p.trace {
 		defer un(trace(p, "Element"))
 	}
@@ -1287,16 +1297,30 @@ func (p *parser) parseElement(keyOk bool) ast.Expr {
 	x := p.checkExpr(p.parseExpr(keyOk))
 	if keyOk {
 		if p.tok == token.COLON {
-			colon := p.pos
-			p.next()
 			// Try to resolve the key but don't collect it
 			// as unresolved identifier if it fails so that
 			// we don't get (possibly false) errors about
 			// undeclared names.
 			p.tryResolve(x, false)
-			return &ast.KeyValueExpr{Key: x, Colon: colon, Value: p.parseElement(false)}
+		} else {
+			// not a key
+			p.resolve(x)
 		}
-		p.resolve(x) // not a key
+	}
+
+	return x
+}
+
+func (p *parser) parseElement() ast.Expr {
+	if p.trace {
+		defer un(trace(p, "Element"))
+	}
+
+	x := p.parseValue(true)
+	if p.tok == token.COLON {
+		colon := p.pos
+		p.next()
+		x = &ast.KeyValueExpr{Key: x, Colon: colon, Value: p.parseValue(false)}
 	}
 
 	return x
@@ -1308,8 +1332,8 @@ func (p *parser) parseElementList() (list []ast.Expr) {
 	}
 
 	for p.tok != token.RBRACE && p.tok != token.EOF {
-		list = append(list, p.parseElement(true))
-		if !p.atComma("composite literal") {
+		list = append(list, p.parseElement())
+		if !p.atComma("composite literal", token.RBRACE) {
 			break
 		}
 		p.next()
@@ -1365,7 +1389,7 @@ func (p *parser) checkExpr(x ast.Expr) ast.Expr {
 	return x
 }
 
-// isTypeName returns true iff x is a (qualified) TypeName.
+// isTypeName reports whether x is a (qualified) TypeName.
 func isTypeName(x ast.Expr) bool {
 	switch t := x.(type) {
 	case *ast.BadExpr:
@@ -1379,7 +1403,7 @@ func isTypeName(x ast.Expr) bool {
 	return true
 }
 
-// isLiteralType returns true iff x is a legal composite literal type.
+// isLiteralType reports whether x is a legal composite literal type.
 func isLiteralType(x ast.Expr) bool {
 	switch t := x.(type) {
 	case *ast.BadExpr:
@@ -1455,7 +1479,8 @@ L:
 				pos := p.pos
 				p.errorExpected(pos, "selector or type assertion")
 				p.next() // make progress
-				x = &ast.BadExpr{From: pos, To: p.pos}
+				sel := &ast.Ident{NamePos: pos, Name: "_"}
+				x = &ast.SelectorExpr{X: x, Sel: sel}
 			}
 		case token.LBRACK:
 			if lhs {

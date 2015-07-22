@@ -8,7 +8,7 @@
 // changes of heap size, processor start/stop, etc and writes them to a buffer
 // in a compact form. A precise nanosecond-precision timestamp and a stack
 // trace is captured for most events.
-// See http://golang.org/s/go15trace for more info.
+// See https://golang.org/s/go15trace for more info.
 
 package runtime
 
@@ -21,7 +21,7 @@ const (
 	traceEvFrequency      = 2  // contains tracer timer frequency [frequency (ticks per second)]
 	traceEvStack          = 3  // stack [stack id, number of PCs, array of PCs]
 	traceEvGomaxprocs     = 4  // current value of GOMAXPROCS [timestamp, GOMAXPROCS, stack id]
-	traceEvProcStart      = 5  // start of P [timestamp]
+	traceEvProcStart      = 5  // start of P [timestamp, thread id]
 	traceEvProcStop       = 6  // stop of P [timestamp]
 	traceEvGCStart        = 7  // GC start [timestamp, stack id]
 	traceEvGCDone         = 8  // GC done [timestamp]
@@ -45,22 +45,28 @@ const (
 	traceEvGoBlockCond    = 26 // goroutine blocks on Cond [timestamp, stack]
 	traceEvGoBlockNet     = 27 // goroutine blocks on network [timestamp, stack]
 	traceEvGoSysCall      = 28 // syscall enter [timestamp, stack]
-	traceEvGoSysExit      = 29 // syscall exit [timestamp, goroutine id]
-	traceEvGoSysBlock     = 30 // syscall blocks [timestamp, stack]
+	traceEvGoSysExit      = 29 // syscall exit [timestamp, goroutine id, real timestamp]
+	traceEvGoSysBlock     = 30 // syscall blocks [timestamp]
 	traceEvGoWaiting      = 31 // denotes that goroutine is blocked when tracing starts [goroutine id]
 	traceEvGoInSyscall    = 32 // denotes that goroutine is in syscall when tracing starts [goroutine id]
-	traceEvHeapAlloc      = 33 // memstats.heap_alloc change [timestamp, heap_alloc]
+	traceEvHeapAlloc      = 33 // memstats.heap_live change [timestamp, heap_alloc]
 	traceEvNextGC         = 34 // memstats.next_gc change [timestamp, next_gc]
 	traceEvTimerGoroutine = 35 // denotes timer goroutine [timer goroutine id]
-	traceEvCount          = 36
+	traceEvFutileWakeup   = 36 // denotes that the previous wakeup of this goroutine was futile [timestamp]
+	traceEvCount          = 37
 )
 
 const (
 	// Timestamps in trace are cputicks/traceTickDiv.
 	// This makes absolute values of timestamp diffs smaller,
 	// and so they are encoded in less number of bytes.
-	// 64 is somewhat arbitrary (one tick is ~20ns on a 3GHz machine).
-	traceTickDiv = 64
+	// 64 on x86 is somewhat arbitrary (one tick is ~20ns on a 3GHz machine).
+	// The suggested increment frequency for PowerPC's time base register is
+	// 512 MHz according to Power ISA v2.07 section 6.2, so we use 16 on ppc64
+	// and ppc64le.
+	// Tracing won't work reliably for architectures where cputicks is emulated
+	// by nanotime, so the value doesn't matter for those architectures.
+	traceTickDiv = 16 + 48*(goarch_386|goarch_amd64|goarch_amd64p32)
 	// Maximum number of PCs in a single stack trace.
 	// Since events contain only stack id rather than whole stack trace,
 	// we can allow quite large values here.
@@ -71,6 +77,13 @@ const (
 	traceBytesPerNumber = 10
 	// Shift of the number of arguments in the first event byte.
 	traceArgCountShift = 6
+	// Flag passed to traceGoPark to denote that the previous wakeup of this
+	// goroutine was futile. For example, a goroutine was unblocked on a mutex,
+	// but another goroutine got ahead and acquired the mutex before the first
+	// goroutine is scheduled, so the first goroutine has to block again.
+	// Such wakeups happen on buffered channels and sync.Mutex,
+	// but are generally not interesting for end user.
+	traceFutileWakeup byte = 128
 )
 
 // trace is global tracing context.
@@ -119,10 +132,7 @@ type traceBuf struct {
 func StartTrace() error {
 	// Stop the world, so that we can take a consistent snapshot
 	// of all goroutines at the beginning of the trace.
-	semacquire(&worldsema, false)
-	_g_ := getg()
-	_g_.m.preemptoff = "start tracing"
-	systemstack(stoptheworld)
+	stopTheWorld("start tracing")
 
 	// We are in stop-the-world, but syscalls can finish and write to trace concurrently.
 	// Exitsyscall could check trace.enabled long before and then suddenly wake up
@@ -133,38 +143,46 @@ func StartTrace() error {
 
 	if trace.enabled || trace.shutdown {
 		unlock(&trace.bufLock)
-		_g_.m.preemptoff = ""
-		semrelease(&worldsema)
-		systemstack(starttheworld)
+		startTheWorld()
 		return errorString("tracing is already enabled")
 	}
 
 	trace.ticksStart = cputicks()
 	trace.timeStart = nanotime()
-	trace.enabled = true
 	trace.headerWritten = false
 	trace.footerWritten = false
 
+	// Can't set trace.enabled yet. While the world is stopped, exitsyscall could
+	// already emit a delayed event (see exitTicks in exitsyscall) if we set trace.enabled here.
+	// That would lead to an inconsistent trace:
+	// - either GoSysExit appears before EvGoInSyscall,
+	// - or GoSysExit appears for a goroutine for which we don't emit EvGoInSyscall below.
+	// To instruct traceEvent that it must not ignore events below, we set startingtrace.
+	// trace.enabled is set afterwards once we have emitted all preliminary events.
+	_g_ := getg()
+	_g_.m.startingtrace = true
 	for _, gp := range allgs {
 		status := readgstatus(gp)
 		if status != _Gdead {
 			traceGoCreate(gp, gp.startpc)
 		}
 		if status == _Gwaiting {
-			traceEvent(traceEvGoWaiting, false, uint64(gp.goid))
+			traceEvent(traceEvGoWaiting, -1, uint64(gp.goid))
 		}
 		if status == _Gsyscall {
-			traceEvent(traceEvGoInSyscall, false, uint64(gp.goid))
+			traceEvent(traceEvGoInSyscall, -1, uint64(gp.goid))
+		} else {
+			gp.sysblocktraced = false
 		}
 	}
 	traceProcStart()
 	traceGoStart()
+	_g_.m.startingtrace = false
+	trace.enabled = true
 
 	unlock(&trace.bufLock)
 
-	_g_.m.preemptoff = ""
-	semrelease(&worldsema)
-	systemstack(starttheworld)
+	startTheWorld()
 	return nil
 }
 
@@ -173,19 +191,14 @@ func StartTrace() error {
 func StopTrace() {
 	// Stop the world so that we can collect the trace buffers from all p's below,
 	// and also to avoid races with traceEvent.
-	semacquire(&worldsema, false)
-	_g_ := getg()
-	_g_.m.preemptoff = "stop tracing"
-	systemstack(stoptheworld)
+	stopTheWorld("stop tracing")
 
 	// See the comment in StartTrace.
 	lock(&trace.bufLock)
 
 	if !trace.enabled {
 		unlock(&trace.bufLock)
-		_g_.m.preemptoff = ""
-		semrelease(&worldsema)
-		systemstack(starttheworld)
+		startTheWorld()
 		return
 	}
 
@@ -223,9 +236,7 @@ func StopTrace() {
 
 	unlock(&trace.bufLock)
 
-	_g_.m.preemptoff = ""
-	semrelease(&worldsema)
-	systemstack(starttheworld)
+	startTheWorld()
 
 	// The world is started but we've set trace.shutdown, so new tracing can't start.
 	// Wait for the trace reader to flush pending buffers and stop.
@@ -302,7 +313,7 @@ func ReadTrace() []byte {
 	// Wait for new data.
 	if trace.fullHead == nil && !trace.shutdown {
 		trace.reader = getg()
-		goparkunlock(&trace.lock, "trace reader (blocked)", traceEvGoBlock)
+		goparkunlock(&trace.lock, "trace reader (blocked)", traceEvGoBlock, 2)
 		lock(&trace.lock)
 	}
 	// Write a buffer.
@@ -405,19 +416,21 @@ func traceFullDequeue() *traceBuf {
 
 // traceEvent writes a single event to trace buffer, flushing the buffer if necessary.
 // ev is event type.
-// If stack, write current stack id as the last argument.
-func traceEvent(ev byte, stack bool, args ...uint64) {
+// If skip > 0, write current stack id as the last argument (skipping skip top frames).
+// If skip = 0, this event type should contain a stack, but we don't want
+// to collect and remember it for this particular call.
+func traceEvent(ev byte, skip int, args ...uint64) {
 	mp, pid, bufp := traceAcquireBuffer()
 	// Double-check trace.enabled now that we've done m.locks++ and acquired bufLock.
 	// This protects from races between traceEvent and StartTrace/StopTrace.
 
 	// The caller checked that trace.enabled == true, but trace.enabled might have been
 	// turned off between the check and now. Check again. traceLockBuffer did mp.locks++,
-	// StopTrace does stoptheworld, and stoptheworld waits for mp.locks to go back to zero,
+	// StopTrace does stopTheWorld, and stopTheWorld waits for mp.locks to go back to zero,
 	// so if we see trace.enabled == true now, we know it's true for the rest of the function.
-	// Exitsyscall can run even during stoptheworld. The race with StartTrace/StopTrace
+	// Exitsyscall can run even during stopTheWorld. The race with StartTrace/StopTrace
 	// during tracing in exitsyscall is resolved by locking trace.bufLock in traceLockBuffer.
-	if !trace.enabled {
+	if !trace.enabled && !mp.startingtrace {
 		traceReleaseBuffer(pid)
 		return
 	}
@@ -440,7 +453,7 @@ func traceEvent(ev byte, stack bool, args ...uint64) {
 	}
 	buf.lastTicks = ticks
 	narg := byte(len(args))
-	if stack {
+	if skip >= 0 {
 		narg++
 	}
 	// We have only 2 bits for number of arguments.
@@ -460,17 +473,23 @@ func traceEvent(ev byte, stack bool, args ...uint64) {
 	for _, a := range args {
 		data = traceAppend(data, a)
 	}
-	if stack {
+	if skip == 0 {
+		data = append(data, 0)
+	} else if skip > 0 {
 		_g_ := getg()
 		gp := mp.curg
-		if gp == nil && ev == traceEvGoSysBlock {
-			gp = _g_
-		}
 		var nstk int
 		if gp == _g_ {
-			nstk = callers(1, buf.stk[:])
+			nstk = callers(skip, buf.stk[:])
 		} else if gp != nil {
-			nstk = gcallers(mp.curg, 1, buf.stk[:])
+			gp = mp.curg
+			nstk = gcallers(gp, skip, buf.stk[:])
+		}
+		if nstk > 0 {
+			nstk-- // skip runtime.goexit
+		}
+		if nstk > 0 && gp.goid == 1 {
+			nstk-- // skip runtime.main
 		}
 		id := trace.stackTab.put(buf.stk[:nstk])
 		data = traceAppend(data, uint64(id))
@@ -490,7 +509,7 @@ func traceEvent(ev byte, stack bool, args ...uint64) {
 // traceAcquireBuffer returns trace buffer to use and, if necessary, locks it.
 func traceAcquireBuffer() (mp *m, pid int32, bufp **traceBuf) {
 	mp = acquirem()
-	if p := mp.p; p != nil {
+	if p := mp.p.ptr(); p != nil {
 		return mp, p.id, &p.tracebuf
 	}
 	lock(&trace.bufLock)
@@ -704,103 +723,106 @@ func (a *traceAlloc) drop() {
 // The following functions write specific events to trace.
 
 func traceGomaxprocs(procs int32) {
-	traceEvent(traceEvGomaxprocs, true, uint64(procs))
+	traceEvent(traceEvGomaxprocs, 1, uint64(procs))
 }
 
 func traceProcStart() {
-	traceEvent(traceEvProcStart, false)
+	traceEvent(traceEvProcStart, -1, uint64(getg().m.id))
 }
 
 func traceProcStop(pp *p) {
-	// Sysmon and stoptheworld can stop Ps blocked in syscalls,
+	// Sysmon and stopTheWorld can stop Ps blocked in syscalls,
 	// to handle this we temporary employ the P.
 	mp := acquirem()
 	oldp := mp.p
-	mp.p = pp
-	traceEvent(traceEvProcStop, false)
+	mp.p.set(pp)
+	traceEvent(traceEvProcStop, -1)
 	mp.p = oldp
 	releasem(mp)
 }
 
 func traceGCStart() {
-	traceEvent(traceEvGCStart, true)
+	traceEvent(traceEvGCStart, 4)
 }
 
 func traceGCDone() {
-	traceEvent(traceEvGCDone, false)
+	traceEvent(traceEvGCDone, -1)
 }
 
 func traceGCScanStart() {
-	traceEvent(traceEvGCScanStart, false)
+	traceEvent(traceEvGCScanStart, -1)
 }
 
 func traceGCScanDone() {
-	traceEvent(traceEvGCScanDone, false)
+	traceEvent(traceEvGCScanDone, -1)
 }
 
 func traceGCSweepStart() {
-	traceEvent(traceEvGCSweepStart, true)
+	traceEvent(traceEvGCSweepStart, 1)
 }
 
 func traceGCSweepDone() {
-	traceEvent(traceEvGCSweepDone, false)
+	traceEvent(traceEvGCSweepDone, -1)
 }
 
 func traceGoCreate(newg *g, pc uintptr) {
-	traceEvent(traceEvGoCreate, true, uint64(newg.goid), uint64(pc))
+	traceEvent(traceEvGoCreate, 2, uint64(newg.goid), uint64(pc))
 }
 
 func traceGoStart() {
-	traceEvent(traceEvGoStart, false, uint64(getg().m.curg.goid))
+	traceEvent(traceEvGoStart, -1, uint64(getg().m.curg.goid))
 }
 
 func traceGoEnd() {
-	traceEvent(traceEvGoEnd, false)
+	traceEvent(traceEvGoEnd, -1)
 }
 
 func traceGoSched() {
-	traceEvent(traceEvGoSched, true)
+	traceEvent(traceEvGoSched, 1)
 }
 
 func traceGoPreempt() {
-	traceEvent(traceEvGoPreempt, true)
+	traceEvent(traceEvGoPreempt, 1)
 }
 
-func traceGoStop() {
-	traceEvent(traceEvGoStop, true)
+func traceGoPark(traceEv byte, skip int, gp *g) {
+	if traceEv&traceFutileWakeup != 0 {
+		traceEvent(traceEvFutileWakeup, -1)
+	}
+	traceEvent(traceEv & ^traceFutileWakeup, skip)
 }
 
-func traceGoPark(traceEv byte, gp *g) {
-	traceEvent(traceEv, true)
-}
-
-func traceGoUnpark(gp *g) {
-	traceEvent(traceEvGoUnblock, true, uint64(gp.goid))
+func traceGoUnpark(gp *g, skip int) {
+	traceEvent(traceEvGoUnblock, skip, uint64(gp.goid))
 }
 
 func traceGoSysCall() {
-	traceEvent(traceEvGoSysCall, true)
+	traceEvent(traceEvGoSysCall, 4)
 }
 
-func traceGoSysExit() {
-	traceEvent(traceEvGoSysExit, false, uint64(getg().m.curg.goid))
+func traceGoSysExit(ts int64) {
+	if ts != 0 && ts < trace.ticksStart {
+		// The timestamp was obtained during a previous tracing session, ignore.
+		return
+	}
+	traceEvent(traceEvGoSysExit, -1, uint64(getg().m.curg.goid), uint64(ts)/traceTickDiv)
 }
 
 func traceGoSysBlock(pp *p) {
-	// Sysmon and stoptheworld can declare syscalls running on remote Ps as blocked,
+	// Sysmon and stopTheWorld can declare syscalls running on remote Ps as blocked,
 	// to handle this we temporary employ the P.
 	mp := acquirem()
 	oldp := mp.p
-	mp.p = pp
-	traceEvent(traceEvGoSysBlock, true)
+	mp.p.set(pp)
+	traceEvent(traceEvGoSysBlock, -1)
 	mp.p = oldp
 	releasem(mp)
 }
 
 func traceHeapAlloc() {
-	traceEvent(traceEvHeapAlloc, false, memstats.heap_alloc)
+	traceEvent(traceEvHeapAlloc, -1, memstats.heap_live)
 }
 
 func traceNextGC() {
-	traceEvent(traceEvNextGC, false, memstats.next_gc)
+	traceEvent(traceEvNextGC, -1, memstats.next_gc)
 }
